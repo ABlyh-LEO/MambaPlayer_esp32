@@ -5,6 +5,7 @@ import json
 import socket
 import sys
 import time
+from pathlib import Path
 
 try:
     import serial
@@ -81,6 +82,20 @@ def usb_wifi(port: str, ssid: str, password: str, baud: int, timeout: float) -> 
     return 1
 
 
+def snapshot(path: str | None = None) -> int:
+    state_path = Path(path) if path else Path(__file__).resolve().parent / "runtime" / "state.json"
+    if not state_path.exists():
+        print(f"snapshot not found: {state_path}", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        print(f"invalid snapshot JSON: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mamba host diagnostic probe")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -97,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     p_usb.add_argument("--password", default="")
     p_usb.add_argument("--baud", type=int, default=115200)
     p_usb.add_argument("--timeout", type=float, default=3.0)
+    p_snapshot = sub.add_parser("snapshot")
+    p_snapshot.add_argument("--path")
     args = parser.parse_args(argv)
     if args.cmd == "tcp-status":
         return tcp_status(args.host, args.port, args.timeout)
@@ -104,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         return udp_listen(args.port, args.timeout)
     if args.cmd == "usb-wifi":
         return usb_wifi(args.port, args.ssid, args.password, args.baud, args.timeout)
+    if args.cmd == "snapshot":
+        return snapshot(args.path)
     return 2
 
 

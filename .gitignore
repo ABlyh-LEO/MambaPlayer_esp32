@@ -5,6 +5,7 @@ sdkconfig.old
 *.pyc
 __pycache__/
 host_app/.venv/
+host_app/runtime/
 .vscode/
 .idea/
 *.swp
