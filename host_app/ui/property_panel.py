@@ -72,14 +72,17 @@ class PropertyPanel(QtWidgets.QWidget):
         self.power_test_button = QtWidgets.QPushButton("Play Power-On")
         self.alarm_test_button = QtWidgets.QPushButton("Play Alarm")
         self.tone_test_button = QtWidgets.QPushButton("Play Tone")
+        self.long_tone_test_button = QtWidgets.QPushButton("Play Tone 30s")
         self.audio_stop_button = QtWidgets.QPushButton("Stop")
         self.power_test_button.clicked.connect(lambda: self.audio_test_requested.emit("power"))
         self.alarm_test_button.clicked.connect(lambda: self.audio_test_requested.emit("alarm"))
         self.tone_test_button.clicked.connect(lambda: self.audio_test_requested.emit("tone"))
+        self.long_tone_test_button.clicked.connect(lambda: self.audio_test_requested.emit("tone30"))
         self.audio_stop_button.clicked.connect(lambda: self.audio_test_requested.emit("stop"))
         test_row.addWidget(self.power_test_button)
         test_row.addWidget(self.alarm_test_button)
         test_row.addWidget(self.tone_test_button)
+        test_row.addWidget(self.long_tone_test_button)
         test_row.addWidget(self.audio_stop_button)
         self.audio_status = QtWidgets.QLabel("16 kHz mono IMA ADPCM on device")
         audio.addLayout(upload_row)
@@ -130,7 +133,12 @@ class PropertyPanel(QtWidgets.QWidget):
                 total = int(storage.get("total", 0))
                 current = audio.get("current", "")
                 playing = "playing" if audio.get("playing") else "idle"
-                self.audio_status.setText(f"{playing} {current} | storage {used}/{total} bytes")
+                diag = audio.get("diag", {})
+                writes = diag.get("write_calls", 0)
+                errors = diag.get("write_errors", 0)
+                self.audio_status.setText(
+                    f"{playing} {current} | storage {used}/{total} bytes | i2s writes {writes}, errors {errors}"
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
 

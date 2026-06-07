@@ -75,6 +75,27 @@ static void set_status(bool playing, const char *file, uint32_t offset, uint32_t
     }
 }
 
+static void note_i2s_start(void)
+{
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s_status.i2s_starts++;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void note_i2s_write(size_t requested, size_t written, esp_err_t err)
+{
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s_status.write_calls++;
+        s_status.write_bytes += (uint32_t)written;
+        s_status.last_write_bytes = (uint32_t)written;
+        if (err != ESP_OK || written != requested) {
+            s_status.write_errors++;
+        }
+        xSemaphoreGive(s_lock);
+    }
+}
+
 void audio_get_status(audio_status_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -254,6 +275,7 @@ static esp_err_t create_i2s(uint32_t sample_rate, i2s_chan_handle_t *tx)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*tx, &std_cfg), TAG, "init i2s std");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(*tx), TAG, "enable i2s");
+    note_i2s_start();
     return ESP_OK;
 }
 
@@ -310,8 +332,10 @@ static void play_file(const char *path, uint32_t offset, bool loop)
         }
         size_t samples = decode_ima_block(block, n, pcm, sizeof(pcm) / sizeof(pcm[0]));
         mono_to_stereo(pcm, stereo, samples);
+        size_t requested = samples * 2 * sizeof(stereo[0]);
         size_t written = 0;
-        i2s_channel_write(tx, stereo, samples * 2 * sizeof(stereo[0]), &written, 1000);
+        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 1000);
+        note_i2s_write(requested, written, err);
         pos += info.block_align;
         if (loop) {
             s_alarm_offset = pos;
@@ -326,7 +350,7 @@ static void play_file(const char *path, uint32_t offset, bool loop)
 
 static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
 {
-    if (duration_ms == 0 || duration_ms > 10000) {
+    if (duration_ms == 0 || duration_ms > 60000) {
         duration_ms = 2000;
     }
     if (frequency_hz < 100 || frequency_hz > 4000) {
@@ -355,8 +379,10 @@ static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
             stereo[i * 2] = sample;
             stereo[i * 2 + 1] = sample;
         }
+        size_t requested = frames * 2 * sizeof(stereo[0]);
         size_t written = 0;
-        i2s_channel_write(tx, stereo, frames * 2 * sizeof(stereo[0]), &written, 1000);
+        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 1000);
+        note_i2s_write(requested, written, err);
         pos += frames;
         set_status(true, "tone", pos, MAMBA_AUDIO_SAMPLE_RATE_HZ);
     }

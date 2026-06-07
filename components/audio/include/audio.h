@@ -26,6 +26,11 @@ typedef struct {
     char file[64];
     uint32_t offset;
     uint32_t sample_rate_hz;
+    uint32_t i2s_starts;
+    uint32_t write_calls;
+    uint32_t write_bytes;
+    uint32_t write_errors;
+    uint32_t last_write_bytes;
 } audio_status_t;
 
 esp_err_t audio_init(void);

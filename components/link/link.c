@@ -318,7 +318,8 @@ static void send_status(uint16_t seq)
         "{\"fw\":\"%s\",\"proto\":%u,\"device\":\"%s\","
         "\"battery\":{\"i2c\":%s,\"capacity\":%u,\"fused_mv\":%lu,\"adc_mv\":%lu,\"current_ma\":%ld,\"temp_decic\":%d},"
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
-        "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\"},"
+        "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\","
+        "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu}},"
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
         "\"wifi\":{\"ssid\":\"%s\",\"tcp_port\":%u,\"udp_hello\":%u,\"udp_telemetry\":%u}}",
@@ -329,6 +330,9 @@ static void send_status(uint16_t seq)
         alarm.active ? "true" : "false", (unsigned long)audio_get_alarm_offset(),
         (unsigned long)alarm.transitions,
         audio.playing ? "true" : "false", s_config.alarm_file, s_config.power_on_file, audio.file,
+        (unsigned long)audio.i2s_starts, (unsigned long)audio.write_calls,
+        (unsigned long)audio.write_bytes, (unsigned long)audio.write_errors,
+        (unsigned long)audio.last_write_bytes,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
@@ -506,6 +510,8 @@ static void handle_audio_test(const link_rx_frame_t *frame)
 {
     if (bytes_contains(frame->payload, frame->len, "stop")) {
         audio_stop_and_save_offset();
+    } else if (bytes_contains(frame->payload, frame->len, "tone30")) {
+        audio_play_tone(30000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "tone")) {
         audio_play_tone(2000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "power")) {
