@@ -14,6 +14,11 @@ except Exception:  # pragma: no cover
 
 try:
     from .mamba_link import (
+        TYPE_ACK,
+        TYPE_AUDIO_BEGIN,
+        TYPE_AUDIO_CHUNK,
+        TYPE_AUDIO_END,
+        TYPE_ERROR,
         TYPE_GET_STATUS,
         TYPE_HELLO,
         TYPE_STATUS,
@@ -22,8 +27,14 @@ try:
         decode_udp_packet,
         encode_frame,
     )
+    from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
 except ImportError:
     from mamba_link import (
+        TYPE_ACK,
+        TYPE_AUDIO_BEGIN,
+        TYPE_AUDIO_CHUNK,
+        TYPE_AUDIO_END,
+        TYPE_ERROR,
         TYPE_GET_STATUS,
         TYPE_HELLO,
         TYPE_STATUS,
@@ -32,6 +43,13 @@ except ImportError:
         decode_udp_packet,
         encode_frame,
     )
+    from audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
+
+
+AUDIO_CHUNK_SIZE = 384
+AUDIO_HEADER_ALLOWANCE_BYTES = 4096
+AUDIO_STORAGE_SAFETY_BYTES = 32 * 1024
+DEFAULT_SPIFFS_TOTAL_BYTES = 1_739_681
 
 
 def tcp_status(host: str, port: int, timeout: float) -> int:
@@ -75,12 +93,40 @@ def wait_usb_ready(ser, parser: FrameParser, timeout: float) -> None:
             return
 
 
+def read_usb_status_frame(ser, parser: FrameParser, seq: int, timeout: float) -> dict:
+    ser.write(encode_frame(TYPE_GET_STATUS, b"{}", seq))
+    ser.flush()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = ser.read(512)
+        for frame in parser.feed(data):
+            if frame.msg_type == TYPE_STATUS:
+                return json.loads(frame.payload.decode(errors="replace"))
+    return {}
+
+
+def send_wait_usb(ser, parser: FrameParser, msg_type: int, payload: bytes, seq: int, timeout: float) -> bytes:
+    ser.write(encode_frame(msg_type, payload, seq))
+    ser.flush()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = ser.read(512)
+        for frame in parser.feed(data):
+            if frame.seq != seq:
+                continue
+            if frame.msg_type == TYPE_ACK:
+                return frame.payload
+            if frame.msg_type == TYPE_ERROR:
+                raise RuntimeError(frame.payload.decode(errors="replace"))
+    raise TimeoutError(f"timeout waiting for ACK seq={seq}")
+
+
 def usb_status(port: str, baud: int, timeout: float) -> int:
     if serial is None:
         print("pyserial not installed", file=sys.stderr)
         return 2
     parser = FrameParser()
-    with serial.Serial(port, baud, timeout=0.1) as ser:
+    with serial.Serial(port, baud, timeout=0.1, write_timeout=timeout) as ser:
         wait_usb_ready(ser, parser, timeout)
         ser.write(encode_frame(TYPE_GET_STATUS, b"{}", 1))
         deadline = time.time() + timeout
@@ -99,7 +145,7 @@ def usb_wifi(port: str, ssid: str, password: str, baud: int, timeout: float) -> 
         return 2
     payload = json.dumps({"ssid": ssid, "password": password}).encode()
     parser = FrameParser()
-    with serial.Serial(port, baud, timeout=0.1) as ser:
+    with serial.Serial(port, baud, timeout=0.1, write_timeout=timeout) as ser:
         wait_usb_ready(ser, parser, timeout)
         ser.write(encode_frame(TYPE_WIFI_CONFIG, payload, 1))
         deadline = time.time() + timeout
@@ -109,6 +155,48 @@ def usb_wifi(port: str, ssid: str, password: str, baud: int, timeout: float) -> 
                 print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
                 return 0
     return 1
+
+
+def alarm_max_seconds_from_status(status: dict) -> float:
+    storage = status.get("storage", {})
+    total = int(storage.get("total") or DEFAULT_SPIFFS_TOTAL_BYTES)
+    power_file_max = int(BYTES_PER_SECOND * POWER_ON_MAX_SECONDS) + AUDIO_HEADER_ALLOWANCE_BYTES
+    alarm_bytes = max(0, total - power_file_max - AUDIO_STORAGE_SAFETY_BYTES)
+    return max(1.0, alarm_bytes / float(BYTES_PER_SECOND))
+
+
+def usb_upload_audio(port: str, kind: str, path: str, baud: int, timeout: float, max_seconds: float | None) -> int:
+    if serial is None:
+        print("pyserial not installed", file=sys.stderr)
+        return 2
+    if kind not in ("alarm", "poweron"):
+        print("kind must be alarm or poweron", file=sys.stderr)
+        return 2
+    parser = FrameParser()
+    with serial.Serial(port, baud, timeout=0.1, write_timeout=timeout) as ser:
+        wait_usb_ready(ser, parser, timeout)
+        status = read_usb_status_frame(ser, parser, 1, timeout)
+        limit = max_seconds
+        if limit is None:
+            limit = POWER_ON_MAX_SECONDS if kind == "poweron" else alarm_max_seconds_from_status(status)
+        wav = convert_to_mamba_wav(path, max_seconds=limit)
+        begin = json.dumps({"kind": kind, "size": len(wav)}).encode()
+        seq = 2
+        send_wait_usb(ser, parser, TYPE_AUDIO_BEGIN, begin, seq, timeout)
+        seq += 1
+        sent = 0
+        while sent < len(wav):
+            chunk = wav[sent:sent + AUDIO_CHUNK_SIZE]
+            send_wait_usb(ser, parser, TYPE_AUDIO_CHUNK, chunk, seq, timeout)
+            seq = (seq + 1) & 0xFFFF or 1
+            sent += len(chunk)
+            if sent == len(wav) or sent % (32 * 1024) < AUDIO_CHUNK_SIZE:
+                print(f"\ruploading {kind}: {sent}/{len(wav)} bytes", end="", flush=True)
+        print()
+        send_wait_usb(ser, parser, TYPE_AUDIO_END, b"{}", seq, timeout)
+        status = read_usb_status_frame(ser, parser, (seq + 1) & 0xFFFF or 1, timeout)
+        print(json.dumps({"uploaded": kind, "source": path, "bytes": len(wav), "status": status}, ensure_ascii=False))
+    return 0
 
 
 def snapshot(path: str | None = None) -> int:
@@ -145,6 +233,13 @@ def main(argv: list[str] | None = None) -> int:
     p_usb.add_argument("--password", default="")
     p_usb.add_argument("--baud", type=int, default=115200)
     p_usb.add_argument("--timeout", type=float, default=3.0)
+    p_upload = sub.add_parser("usb-upload-audio")
+    p_upload.add_argument("--port", required=True)
+    p_upload.add_argument("--kind", choices=("alarm", "poweron"), required=True)
+    p_upload.add_argument("--file", required=True)
+    p_upload.add_argument("--baud", type=int, default=115200)
+    p_upload.add_argument("--timeout", type=float, default=5.0)
+    p_upload.add_argument("--max-seconds", type=float)
     p_snapshot = sub.add_parser("snapshot")
     p_snapshot.add_argument("--path")
     args = parser.parse_args(argv)
@@ -156,6 +251,8 @@ def main(argv: list[str] | None = None) -> int:
         return usb_status(args.port, args.baud, args.timeout)
     if args.cmd == "usb-wifi":
         return usb_wifi(args.port, args.ssid, args.password, args.baud, args.timeout)
+    if args.cmd == "usb-upload-audio":
+        return usb_upload_audio(args.port, args.kind, args.file, args.baud, args.timeout, args.max_seconds)
     if args.cmd == "snapshot":
         return snapshot(args.path)
     return 2

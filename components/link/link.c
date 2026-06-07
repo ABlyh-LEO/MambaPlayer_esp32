@@ -74,6 +74,7 @@ static volatile uint32_t s_usb_rx_bytes;
 static volatile uint32_t s_usb_rx_frames;
 static volatile uint32_t s_usb_rx_loops;
 static volatile uint32_t s_usb_rx_empty;
+static volatile bool s_upload_active;
 
 static int ensure_udp_socket(void)
 {
@@ -355,6 +356,7 @@ static void close_upload(void)
         unlink(s_upload.tmp_path);
     }
     memset(&s_upload, 0, sizeof(s_upload));
+    s_upload_active = false;
 }
 
 static void handle_audio_begin(const link_rx_frame_t *frame)
@@ -377,6 +379,7 @@ static void handle_audio_begin(const link_rx_frame_t *frame)
         send_error(frame->seq, "audio too large");
         return;
     }
+    audio_stop_and_save_offset();
     close_upload();
     strlcpy(s_upload.tmp_path, alarm ? "/spiffs/alarm.tmp" : "/spiffs/poweron.tmp", sizeof(s_upload.tmp_path));
     strlcpy(s_upload.final_path, alarm ? MAMBA_DEFAULT_ALARM_FILE : MAMBA_DEFAULT_POWER_ON_FILE, sizeof(s_upload.final_path));
@@ -389,6 +392,7 @@ static void handle_audio_begin(const link_rx_frame_t *frame)
         send_error(frame->seq, "open failed");
         return;
     }
+    s_upload_active = true;
     send_ack(frame->seq, "audio begin");
 }
 
@@ -453,6 +457,7 @@ static void handle_audio_end(const link_rx_frame_t *frame)
     }
     storage_save_config(&s_config);
     memset(&s_upload, 0, sizeof(s_upload));
+    s_upload_active = false;
     send_ack(frame->seq, "audio uploaded");
 }
 
@@ -692,8 +697,10 @@ static void telemetry_task(void *arg)
                 (unsigned long)esp_get_free_heap_size());
             if (n > 0) {
                 send_udp_payload(MAMBA_STREAM_BATTERY, json, (size_t)n);
-                send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
-                send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
+                if (!s_upload_active) {
+                    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
+                    send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(s_config.telemetry_interval_ms > 0 ? s_config.telemetry_interval_ms : 100));
