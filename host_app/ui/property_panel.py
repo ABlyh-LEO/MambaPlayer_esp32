@@ -81,6 +81,12 @@ class PropertyPanel(QtWidgets.QWidget):
         except Exception:
             self.serial_combo.addItem("pyserial unavailable", "")
 
+    def select_serial_port(self, port_name: str) -> None:
+        for index in range(self.serial_combo.count()):
+            if self.serial_combo.itemData(index) == port_name:
+                self.serial_combo.setCurrentIndex(index)
+                return
+
     def refresh(self) -> None:
         self.tcp_label.setText(self.store.state.tcp)
         self.udp_label.setText(self.store.state.udp_hello)

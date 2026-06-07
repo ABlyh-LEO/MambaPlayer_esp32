@@ -147,6 +147,7 @@ class UdpListener(QtCore.QThread):
 class SerialWorker(QtCore.QThread):
     frame_received = QtCore.Signal(int, bytes)
     state = QtCore.Signal(str)
+    ready = QtCore.Signal()
 
     def __init__(self, port: str, baud: int = 115200) -> None:
         super().__init__()
@@ -156,6 +157,7 @@ class SerialWorker(QtCore.QThread):
         self._ser = None
         self._parser = FrameParser()
         self._ready = threading.Event()
+        self._ready_emitted = False
 
     def run(self) -> None:
         if serial is None:
@@ -171,9 +173,14 @@ class SerialWorker(QtCore.QThread):
             data = self._ser.read(512)
             if data:
                 for frame in self._parser.feed(data):
-                    self._ready.set()
+                    if not self._ready.is_set():
+                        self._ready.set()
+                    if not self._ready_emitted:
+                        self._ready_emitted = True
+                        self.ready.emit()
                     self.frame_received.emit(frame.msg_type, frame.payload)
-        self._ser.close()
+        if self._ser:
+            self._ser.close()
 
     def send(self, msg_type: int, payload: bytes = b"") -> None:
         if self._ser:
@@ -182,6 +189,11 @@ class SerialWorker(QtCore.QThread):
 
     def stop(self) -> None:
         self._running = False
+        if self._ser:
+            try:
+                self._ser.cancel_read()
+            except Exception:
+                pass
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -199,6 +211,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.udp_hello = UdpListener(UDP_HELLO_PORT)
         self.udp_tel = UdpListener(UDP_TELEMETRY_PORT)
         self.serial_worker: SerialWorker | None = None
+        self._shutdown_done = False
         self.mock_timer = QtCore.QTimer(self)
         self.mock_timer.timeout.connect(self._mock_tick)
         self._build_ui()
@@ -207,6 +220,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tcp.start()
             self.udp_hello.start()
             self.udp_tel.start()
+            QtCore.QTimer.singleShot(0, self._auto_connect_serial)
 
     def _build_ui(self) -> None:
         self.wave = WavePanel(self.store)
@@ -270,16 +284,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send(TYPE_WIFI_CONFIG, payload)
         self._log(f"Wi-Fi config sent for SSID {ssid!r}")
 
+    def _auto_connect_serial(self) -> None:
+        try:
+            import serial.tools.list_ports
+        except Exception:
+            return
+        self.properties.refresh_ports()
+        for port in serial.tools.list_ports.comports():
+            hwid = (port.hwid or "").upper()
+            if "VID:PID=303A:1001" in hwid:
+                self.properties.select_serial_port(port.device)
+                self._connect_serial(port.device)
+                return
+
     def _connect_serial(self, port: str) -> None:
         if not port:
             self.properties.refresh_ports()
             return
         if self.serial_worker:
-            self.serial_worker.stop()
+            self._stop_worker(self.serial_worker)
         self.serial_worker = SerialWorker(port)
         self.serial_worker.frame_received.connect(self._handle_frame)
         self.serial_worker.state.connect(lambda text: self.store.update_state(usb=text))
         self.serial_worker.state.connect(lambda text: self._log(f"USB: {text}"))
+        self.serial_worker.ready.connect(lambda: self._send(TYPE_GET_STATUS, b"{}"))
         self.serial_worker.start()
 
     def _tcp_changed(self, text: str) -> None:
@@ -408,13 +436,24 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log(self, text: str) -> None:
         self.log.appendPlainText(text)
 
+    def _stop_worker(self, worker: QtCore.QThread | None) -> None:
+        if not worker:
+            return
+        stop = getattr(worker, "stop", None)
+        if callable(stop):
+            stop()
+        if worker.isRunning() and not worker.wait(1500):
+            worker.terminate()
+            worker.wait(500)
+
+    def shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self.mock_timer.stop()
+        for worker in (self.serial_worker, self.tcp, self.udp_hello, self.udp_tel):
+            self._stop_worker(worker)
+
     def closeEvent(self, event) -> None:
-        self.tcp.stop()
-        self.udp_hello.stop()
-        self.udp_tel.stop()
-        if self.serial_worker:
-            self.serial_worker.stop()
-        for worker in (self.tcp, self.udp_hello, self.udp_tel, self.serial_worker):
-            if worker and worker.isRunning():
-                worker.wait(800)
+        self.shutdown()
         super().closeEvent(event)
