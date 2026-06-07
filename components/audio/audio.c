@@ -14,6 +14,7 @@
 
 typedef enum {
     AUDIO_CMD_PLAY,
+    AUDIO_CMD_TONE,
     AUDIO_CMD_STOP,
     AUDIO_CMD_RESET_OFFSET,
 } audio_cmd_type_t;
@@ -22,6 +23,8 @@ typedef struct {
     audio_cmd_type_t type;
     char path[64];
     uint32_t offset;
+    uint32_t duration_ms;
+    uint32_t frequency_hz;
     bool loop;
 } audio_cmd_t;
 
@@ -235,7 +238,7 @@ static esp_err_t create_i2s(uint32_t sample_rate, i2s_chan_handle_t *tx)
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, tx, NULL), TAG, "new i2s");
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = GPIO_NUM_NC,
             .bclk = MAMBA_I2S_BCLK_GPIO,
@@ -252,6 +255,14 @@ static esp_err_t create_i2s(uint32_t sample_rate, i2s_chan_handle_t *tx)
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*tx, &std_cfg), TAG, "init i2s std");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(*tx), TAG, "enable i2s");
     return ESP_OK;
+}
+
+static void mono_to_stereo(const int16_t *mono, int16_t *stereo, size_t samples)
+{
+    for (size_t i = 0; i < samples; ++i) {
+        stereo[i * 2] = mono[i];
+        stereo[i * 2 + 1] = mono[i];
+    }
 }
 
 static void play_file(const char *path, uint32_t offset, bool loop)
@@ -273,6 +284,7 @@ static void play_file(const char *path, uint32_t offset, bool loop)
 
     uint8_t block[MAMBA_AUDIO_ADPCM_BLOCK_ALIGN];
     int16_t pcm[MAMBA_AUDIO_ADPCM_SAMPLES_PER_BLOCK];
+    int16_t stereo[MAMBA_AUDIO_ADPCM_SAMPLES_PER_BLOCK * 2];
     uint32_t pos = offset < info.data_size ? offset - (offset % info.block_align) : 0;
     set_status(true, path, pos, info.sample_rate_hz);
     s_stop_requested = false;
@@ -297,8 +309,9 @@ static void play_file(const char *path, uint32_t offset, bool loop)
             break;
         }
         size_t samples = decode_ima_block(block, n, pcm, sizeof(pcm) / sizeof(pcm[0]));
+        mono_to_stereo(pcm, stereo, samples);
         size_t written = 0;
-        i2s_channel_write(tx, pcm, samples * sizeof(pcm[0]), &written, 1000);
+        i2s_channel_write(tx, stereo, samples * 2 * sizeof(stereo[0]), &written, 1000);
         pos += info.block_align;
         if (loop) {
             s_alarm_offset = pos;
@@ -311,6 +324,47 @@ static void play_file(const char *path, uint32_t offset, bool loop)
     set_status(false, path, loop ? s_alarm_offset : pos, info.sample_rate_hz);
 }
 
+static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
+{
+    if (duration_ms == 0 || duration_ms > 10000) {
+        duration_ms = 2000;
+    }
+    if (frequency_hz < 100 || frequency_hz > 4000) {
+        frequency_hz = 1000;
+    }
+    i2s_chan_handle_t tx = NULL;
+    if (create_i2s(MAMBA_AUDIO_SAMPLE_RATE_HZ, &tx) != ESP_OK) {
+        return;
+    }
+    enum { TONE_FRAMES = 256 };
+    int16_t stereo[TONE_FRAMES * 2];
+    uint32_t total_frames = (MAMBA_AUDIO_SAMPLE_RATE_HZ * duration_ms) / 1000;
+    uint32_t half_period = MAMBA_AUDIO_SAMPLE_RATE_HZ / (frequency_hz * 2);
+    if (half_period == 0) {
+        half_period = 1;
+    }
+    set_status(true, "tone", 0, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+    s_stop_requested = false;
+    for (uint32_t pos = 0; pos < total_frames && !s_stop_requested;) {
+        uint32_t frames = total_frames - pos;
+        if (frames > TONE_FRAMES) {
+            frames = TONE_FRAMES;
+        }
+        for (uint32_t i = 0; i < frames; ++i) {
+            int16_t sample = (((pos + i) / half_period) & 1) ? 22000 : -22000;
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample;
+        }
+        size_t written = 0;
+        i2s_channel_write(tx, stereo, frames * 2 * sizeof(stereo[0]), &written, 1000);
+        pos += frames;
+        set_status(true, "tone", pos, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+    }
+    i2s_channel_disable(tx);
+    i2s_del_channel(tx);
+    set_status(false, "tone", total_frames, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+}
+
 static void audio_task(void *arg)
 {
     audio_cmd_t cmd;
@@ -320,6 +374,8 @@ static void audio_task(void *arg)
         }
         if (cmd.type == AUDIO_CMD_PLAY) {
             play_file(cmd.path, cmd.offset, cmd.loop);
+        } else if (cmd.type == AUDIO_CMD_TONE) {
+            play_tone(cmd.duration_ms, cmd.frequency_hz);
         } else if (cmd.type == AUDIO_CMD_STOP) {
             s_stop_requested = true;
         } else if (cmd.type == AUDIO_CMD_RESET_OFFSET) {
@@ -347,6 +403,18 @@ esp_err_t audio_play_once(const char *path)
     return xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(20)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
+esp_err_t audio_play_tone(uint32_t duration_ms, uint32_t frequency_hz)
+{
+    ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
+    s_stop_requested = true;
+    audio_cmd_t cmd = {
+        .type = AUDIO_CMD_TONE,
+        .duration_ms = duration_ms,
+        .frequency_hz = frequency_hz,
+    };
+    return xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(20)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 esp_err_t audio_stop_and_save_offset(void)
 {
     ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
@@ -360,7 +428,7 @@ esp_err_t audio_init(void)
     s_queue = xQueueCreate(4, sizeof(audio_cmd_t));
     s_lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_queue && s_lock, ESP_ERR_NO_MEM, TAG, "audio alloc");
-    BaseType_t ok = xTaskCreate(audio_task, "audio_task", 4096, NULL, 4, NULL);
+    BaseType_t ok = xTaskCreate(audio_task, "audio_task", 6144, NULL, 4, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "audio task");
     ESP_LOGI(TAG, "audio ready, wav self-test=%s", audio_self_test() ? "ok" : "fail");
     return ESP_OK;

@@ -31,6 +31,7 @@ typedef struct {
 esp_err_t audio_init(void);
 esp_err_t audio_play_alarm(const char *path, uint32_t offset);
 esp_err_t audio_play_once(const char *path);
+esp_err_t audio_play_tone(uint32_t duration_ms, uint32_t frequency_hz);
 esp_err_t audio_stop_and_save_offset(void);
 void audio_reset_alarm_offset(void);
 uint32_t audio_get_alarm_offset(void);

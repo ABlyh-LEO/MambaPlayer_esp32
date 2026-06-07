@@ -506,6 +506,8 @@ static void handle_audio_test(const link_rx_frame_t *frame)
 {
     if (bytes_contains(frame->payload, frame->len, "stop")) {
         audio_stop_and_save_offset();
+    } else if (bytes_contains(frame->payload, frame->len, "tone")) {
+        audio_play_tone(2000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "power")) {
         audio_play_once(s_config.power_on_file);
     } else {
