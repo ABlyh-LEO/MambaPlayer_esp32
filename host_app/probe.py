@@ -16,6 +16,7 @@ try:
     from .mamba_link import (
         TYPE_GET_STATUS,
         TYPE_HELLO,
+        TYPE_STATUS,
         TYPE_WIFI_CONFIG,
         FrameParser,
         decode_udp_packet,
@@ -25,6 +26,7 @@ except ImportError:
     from mamba_link import (
         TYPE_GET_STATUS,
         TYPE_HELLO,
+        TYPE_STATUS,
         TYPE_WIFI_CONFIG,
         FrameParser,
         decode_udp_packet,
@@ -85,8 +87,9 @@ def usb_status(port: str, baud: int, timeout: float) -> int:
         while time.time() < deadline:
             data = ser.read(512)
             for frame in parser.feed(data):
-                print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
-                return 0
+                if frame.msg_type == TYPE_STATUS:
+                    print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
+                    return 0
     return 1
 
 

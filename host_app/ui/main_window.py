@@ -19,6 +19,12 @@ from ..mamba_link import (
     STREAM_BATTERY,
     STREAM_CAN_RAW,
     STREAM_JUSTFLOAT,
+    TYPE_ACK,
+    TYPE_AUDIO_BEGIN,
+    TYPE_AUDIO_CHUNK,
+    TYPE_AUDIO_END,
+    TYPE_AUDIO_TEST,
+    TYPE_ERROR,
     TYPE_GET_STATUS,
     TYPE_HELLO,
     TYPE_STATUS,
@@ -29,6 +35,7 @@ from ..mamba_link import (
     parse_can_payload,
     parse_justfloat_payload,
 )
+from ..audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
 from ..telemetry.store import TelemetryStore
 from .channel_panel import ChannelPanel
 from .property_panel import PropertyPanel
@@ -39,6 +46,10 @@ TCP_PORT = 37210
 UDP_HELLO_PORT = 37211
 UDP_TELEMETRY_PORT = 37212
 STATE_PATH = Path(__file__).resolve().parents[1] / "runtime" / "state.json"
+AUDIO_CHUNK_SIZE = 384
+AUDIO_HEADER_ALLOWANCE_BYTES = 4096
+AUDIO_STORAGE_SAFETY_BYTES = 32 * 1024
+DEFAULT_SPIFFS_TOTAL_BYTES = 1_739_681
 
 
 class TcpServer(QtCore.QThread):
@@ -158,6 +169,9 @@ class SerialWorker(QtCore.QThread):
         self._parser = FrameParser()
         self._ready = threading.Event()
         self._ready_emitted = False
+        self._ack_cond = threading.Condition()
+        self._acks: dict[int, tuple[int, bytes]] = {}
+        self._seq = 1
 
     def run(self) -> None:
         if serial is None:
@@ -178,6 +192,10 @@ class SerialWorker(QtCore.QThread):
                     if not self._ready_emitted:
                         self._ready_emitted = True
                         self.ready.emit()
+                    if frame.msg_type in (TYPE_ACK, TYPE_ERROR):
+                        with self._ack_cond:
+                            self._acks[frame.seq] = (frame.msg_type, frame.payload)
+                            self._ack_cond.notify_all()
                     self.frame_received.emit(frame.msg_type, frame.payload)
         if self._ser:
             self._ser.close()
@@ -185,7 +203,34 @@ class SerialWorker(QtCore.QThread):
     def send(self, msg_type: int, payload: bytes = b"") -> None:
         if self._ser:
             self._ready.wait(timeout=2.0)
-            self._ser.write(encode_frame(msg_type, payload, int(time.time() * 10) & 0xFFFF))
+            self._ser.write(encode_frame(msg_type, payload, self._next_seq()))
+
+    def send_wait(self, msg_type: int, payload: bytes = b"", timeout: float = 3.0) -> bytes:
+        if not self._ser:
+            raise RuntimeError("USB serial is not connected")
+        self._ready.wait(timeout=2.0)
+        seq = self._next_seq()
+        with self._ack_cond:
+            self._acks.pop(seq, None)
+        self._ser.write(encode_frame(msg_type, payload, seq))
+        self._ser.flush()
+        deadline = time.monotonic() + timeout
+        with self._ack_cond:
+            while seq not in self._acks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"timeout waiting for ACK seq={seq}")
+                self._ack_cond.wait(remaining)
+            msg_type, response = self._acks.pop(seq)
+        if msg_type == TYPE_ERROR:
+            raise RuntimeError(response.decode(errors="replace"))
+        return response
+
+    def _next_seq(self) -> int:
+        self._seq = (self._seq + 1) & 0xFFFF
+        if self._seq == 0:
+            self._seq = 1
+        return self._seq
 
     def stop(self) -> None:
         self._running = False
@@ -266,6 +311,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.udp_tel.telemetry.connect(self._handle_telemetry)
         self.properties.status_requested.connect(lambda: self._send(TYPE_GET_STATUS, b"{}"))
         self.properties.wifi_requested.connect(self._send_wifi)
+        self.properties.audio_upload_requested.connect(self._upload_audio)
+        self.properties.audio_test_requested.connect(self._test_audio)
         self.properties.mock_toggled.connect(self._toggle_mock)
         self.properties.serial_connect_requested.connect(self._connect_serial)
         self.store.can_changed.connect(self._refresh_can_table)
@@ -283,6 +330,60 @@ class MainWindow(QtWidgets.QMainWindow):
         payload = json.dumps({"ssid": ssid, "password": password}).encode()
         self._send(TYPE_WIFI_CONFIG, payload)
         self._log(f"Wi-Fi config sent for SSID {ssid!r}")
+
+    def _status_json(self) -> dict:
+        try:
+            return json.loads(self.store.state.last_status or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def _alarm_max_seconds(self) -> float:
+        status = self._status_json()
+        storage = status.get("storage", {})
+        total = int(storage.get("total") or DEFAULT_SPIFFS_TOTAL_BYTES)
+        power_file_max = int(BYTES_PER_SECOND * POWER_ON_MAX_SECONDS) + AUDIO_HEADER_ALLOWANCE_BYTES
+        alarm_bytes = max(0, total - power_file_max - AUDIO_STORAGE_SAFETY_BYTES)
+        return max(1.0, alarm_bytes / float(BYTES_PER_SECOND))
+
+    def _send_control_only(self, msg_type: int, payload: bytes) -> None:
+        if self.serial_worker:
+            self.serial_worker.send(msg_type, payload)
+        else:
+            self.tcp.send(msg_type, payload)
+
+    def _upload_audio(self, kind: str, path: str) -> None:
+        if not self.serial_worker:
+            QtWidgets.QMessageBox.warning(self, "Audio Upload", "Connect USB before uploading audio.")
+            return
+        max_seconds = POWER_ON_MAX_SECONDS if kind == "poweron" else self._alarm_max_seconds()
+        try:
+            wav = convert_to_mamba_wav(path, max_seconds=max_seconds)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Audio Upload", str(exc))
+            self._log(f"audio upload rejected: {exc}")
+            return
+
+        begin = json.dumps({"kind": kind, "size": len(wav)}).encode()
+        try:
+            self.serial_worker.send_wait(TYPE_AUDIO_BEGIN, begin)
+            sent = 0
+            while sent < len(wav):
+                chunk = wav[sent:sent + AUDIO_CHUNK_SIZE]
+                self.serial_worker.send_wait(TYPE_AUDIO_CHUNK, chunk, timeout=4.0)
+                sent += len(chunk)
+                self.properties.audio_status.setText(f"uploading {kind}: {sent}/{len(wav)} bytes")
+                QtWidgets.QApplication.processEvents()
+            self.serial_worker.send_wait(TYPE_AUDIO_END, b"{}", timeout=6.0)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Audio Upload", str(exc))
+            self._log(f"audio upload failed: {exc}")
+            return
+        self._log(f"uploaded {kind} audio: {len(wav)} bytes from {path}")
+        self._send(TYPE_GET_STATUS, b"{}")
+
+    def _test_audio(self, command: str) -> None:
+        self._send_control_only(TYPE_AUDIO_TEST, json.dumps({"cmd": command}).encode())
+        self._log(f"audio test command: {command}")
 
     def _auto_connect_serial(self) -> None:
         try:

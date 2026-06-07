@@ -199,7 +199,18 @@ static size_t alarm_max_file_bytes(void)
 static void send_bytes_usb(const uint8_t *data, size_t len)
 {
     if (usb_serial_jtag_is_driver_installed() && usb_serial_jtag_is_connected()) {
-        usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(20));
+        size_t sent = 0;
+        while (sent < len) {
+            size_t chunk = len - sent;
+            if (chunk > 128) {
+                chunk = 128;
+            }
+            int written = usb_serial_jtag_write_bytes(data + sent, chunk, pdMS_TO_TICKS(100));
+            if (written <= 0) {
+                break;
+            }
+            sent += (size_t)written;
+        }
     }
 }
 

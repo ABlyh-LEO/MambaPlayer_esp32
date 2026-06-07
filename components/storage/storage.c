@@ -13,6 +13,7 @@
 
 static const char *TAG = "storage";
 static const char *NVS_NS = "mamba";
+static storage_info_t s_cached_info;
 
 static void load_string(nvs_handle_t nvs, const char *key, char *value, size_t value_len)
 {
@@ -103,7 +104,11 @@ esp_err_t storage_save_config(const mamba_config_t *config)
 
 esp_err_t storage_get_info(storage_info_t *info)
 {
-    return esp_spiffs_info("storage", &info->total_bytes, &info->used_bytes);
+    if (!info) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *info = s_cached_info;
+    return s_cached_info.total_bytes > 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t storage_list_audio_json(char *out, size_t out_len)
@@ -162,9 +167,9 @@ esp_err_t storage_init(mamba_config_t *config)
         .format_if_mount_failed = true,
     };
     ESP_RETURN_ON_ERROR(esp_vfs_spiffs_register(&spiffs), TAG, "spiffs mount");
-    storage_info_t info = {0};
-    if (storage_get_info(&info) == ESP_OK) {
-        ESP_LOGI(TAG, "SPIFFS total=%u used=%u", (unsigned)info.total_bytes, (unsigned)info.used_bytes);
+    if (esp_spiffs_info("storage", &s_cached_info.total_bytes, &s_cached_info.used_bytes) == ESP_OK) {
+        ESP_LOGI(TAG, "SPIFFS total=%u used=%u", (unsigned)s_cached_info.total_bytes,
+                 (unsigned)s_cached_info.used_bytes);
     }
     return storage_load_config(config);
 }

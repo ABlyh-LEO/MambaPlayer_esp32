@@ -13,6 +13,8 @@ class PropertyPanel(QtWidgets.QWidget):
     status_requested = QtCore.Signal()
     mock_toggled = QtCore.Signal(bool)
     serial_connect_requested = QtCore.Signal(str)
+    audio_upload_requested = QtCore.Signal(str, str)
+    audio_test_requested = QtCore.Signal(str)
 
     def __init__(self, store: TelemetryStore, wave: WavePanel) -> None:
         super().__init__()
@@ -57,6 +59,31 @@ class PropertyPanel(QtWidgets.QWidget):
         wifi.addRow("", self.wifi_button)
         layout.addWidget(self.wifi)
 
+        self.audio = QtWidgets.QGroupBox("Audio")
+        audio = QtWidgets.QVBoxLayout(self.audio)
+        upload_row = QtWidgets.QHBoxLayout()
+        self.power_upload_button = QtWidgets.QPushButton("Upload Power-On")
+        self.alarm_upload_button = QtWidgets.QPushButton("Upload Alarm")
+        self.power_upload_button.clicked.connect(lambda: self._pick_audio("poweron"))
+        self.alarm_upload_button.clicked.connect(lambda: self._pick_audio("alarm"))
+        upload_row.addWidget(self.power_upload_button)
+        upload_row.addWidget(self.alarm_upload_button)
+        test_row = QtWidgets.QHBoxLayout()
+        self.power_test_button = QtWidgets.QPushButton("Play Power-On")
+        self.alarm_test_button = QtWidgets.QPushButton("Play Alarm")
+        self.audio_stop_button = QtWidgets.QPushButton("Stop")
+        self.power_test_button.clicked.connect(lambda: self.audio_test_requested.emit("power"))
+        self.alarm_test_button.clicked.connect(lambda: self.audio_test_requested.emit("alarm"))
+        self.audio_stop_button.clicked.connect(lambda: self.audio_test_requested.emit("stop"))
+        test_row.addWidget(self.power_test_button)
+        test_row.addWidget(self.alarm_test_button)
+        test_row.addWidget(self.audio_stop_button)
+        self.audio_status = QtWidgets.QLabel("16 kHz mono IMA ADPCM on device")
+        audio.addLayout(upload_row)
+        audio.addLayout(test_row)
+        audio.addWidget(self.audio_status)
+        layout.addWidget(self.audio)
+
         self.measure_box = QtWidgets.QGroupBox("Cursor Measurement")
         measure_layout = QtWidgets.QVBoxLayout(self.measure_box)
         self.measure_text = QtWidgets.QPlainTextEdit()
@@ -91,6 +118,18 @@ class PropertyPanel(QtWidgets.QWidget):
         self.tcp_label.setText(self.store.state.tcp)
         self.udp_label.setText(self.store.state.udp_hello)
         self.usb_label.setText(self.store.state.usb)
+        if self.store.state.last_status:
+            try:
+                status = json.loads(self.store.state.last_status)
+                audio = status.get("audio", {})
+                storage = status.get("storage", {})
+                used = int(storage.get("used", 0))
+                total = int(storage.get("total", 0))
+                current = audio.get("current", "")
+                playing = "playing" if audio.get("playing") else "idle"
+                self.audio_status.setText(f"{playing} {current} | storage {used}/{total} bytes")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
 
     def refresh_measurements(self) -> None:
         data = self.wave.measurements()
@@ -105,3 +144,14 @@ class PropertyPanel(QtWidgets.QWidget):
     def _mock_changed(self, checked: bool) -> None:
         self.mock_button.setText("Stop Mock" if checked else "Start Mock")
         self.mock_toggled.emit(checked)
+
+    def _pick_audio(self, kind: str) -> None:
+        title = "Upload Alarm Audio" if kind == "alarm" else "Upload Power-On Audio"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            title,
+            "",
+            "Audio Files (*.wav *.flac *.ogg *.aiff *.aif);;All Files (*)",
+        )
+        if path:
+            self.audio_upload_requested.emit(kind, path)
