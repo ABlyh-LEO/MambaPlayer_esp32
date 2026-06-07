@@ -4,6 +4,7 @@ import json
 import random
 import socket
 import struct
+import threading
 import time
 from pathlib import Path
 
@@ -154,6 +155,7 @@ class SerialWorker(QtCore.QThread):
         self._running = True
         self._ser = None
         self._parser = FrameParser()
+        self._ready = threading.Event()
 
     def run(self) -> None:
         if serial is None:
@@ -169,11 +171,13 @@ class SerialWorker(QtCore.QThread):
             data = self._ser.read(512)
             if data:
                 for frame in self._parser.feed(data):
+                    self._ready.set()
                     self.frame_received.emit(frame.msg_type, frame.payload)
         self._ser.close()
 
     def send(self, msg_type: int, payload: bytes = b"") -> None:
         if self._ser:
+            self._ready.wait(timeout=2.0)
             self._ser.write(encode_frame(msg_type, payload, int(time.time() * 10) & 0xFFFF))
 
     def stop(self) -> None:

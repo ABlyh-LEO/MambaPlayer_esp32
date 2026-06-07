@@ -12,6 +12,7 @@
 #include "battery.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -22,7 +23,7 @@
 #include "lwip/sockets.h"
 #include "storage.h"
 
-#define LINK_QUEUE_DEPTH 16
+#define LINK_QUEUE_DEPTH 8
 #define LINK_HEADER_LEN 12
 #define LINK_UDP_MAX 1200
 
@@ -57,6 +58,7 @@ typedef struct {
 static const char *TAG = "link";
 static QueueHandle_t s_rx_queue;
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_tx_lock;
 static mamba_config_t s_config;
 static mamba_link_config_updated_cb_t s_config_cb;
 static int s_tcp_sock = -1;
@@ -67,6 +69,23 @@ static uint16_t s_udp_tel_port = MAMBA_LINK_UDP_TELEMETRY_PORT;
 static uint16_t s_seq;
 static uint32_t s_udp_seq;
 static audio_upload_t s_upload;
+static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
+static volatile uint32_t s_usb_rx_bytes;
+static volatile uint32_t s_usb_rx_frames;
+static volatile uint32_t s_usb_rx_loops;
+static volatile uint32_t s_usb_rx_empty;
+
+static int ensure_udp_socket(void)
+{
+    if (s_udp_sock >= 0) {
+        return s_udp_sock;
+    }
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock >= 0) {
+        s_udp_sock = sock;
+    }
+    return s_udp_sock;
+}
 
 static uint16_t le16(const uint8_t *p)
 {
@@ -198,27 +217,30 @@ static void send_bytes_tcp(const uint8_t *data, size_t len)
 
 static void send_frame(link_tx_target_t target, uint8_t type, uint16_t seq, const void *payload, size_t len)
 {
-    if (len > MAMBA_LINK_MAX_PAYLOAD) {
+    if (len > MAMBA_LINK_MAX_PAYLOAD || !s_tx_lock) {
         return;
     }
-    uint8_t buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
-    buf[0] = MAMBA_LINK_SYNC0;
-    buf[1] = MAMBA_LINK_SYNC1;
-    buf[2] = MAMBA_PROTOCOL_VERSION;
-    buf[3] = type;
-    buf[4] = 0;
-    buf[5] = 0;
-    put16(buf + 6, seq);
-    put16(buf + 8, (uint16_t)len);
-    put16(buf + 10, payload ? crc16_ccitt(payload, len) : 0);
+    if (xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    s_tx_buf[0] = MAMBA_LINK_SYNC0;
+    s_tx_buf[1] = MAMBA_LINK_SYNC1;
+    s_tx_buf[2] = MAMBA_PROTOCOL_VERSION;
+    s_tx_buf[3] = type;
+    s_tx_buf[4] = 0;
+    s_tx_buf[5] = 0;
+    put16(s_tx_buf + 6, seq);
+    put16(s_tx_buf + 8, (uint16_t)len);
+    put16(s_tx_buf + 10, payload ? crc16_ccitt(payload, len) : 0);
     if (payload && len > 0) {
-        memcpy(buf + LINK_HEADER_LEN, payload, len);
+        memcpy(s_tx_buf + LINK_HEADER_LEN, payload, len);
     }
     if (target == LINK_TX_USB) {
-        send_bytes_usb(buf, LINK_HEADER_LEN + len);
+        send_bytes_usb(s_tx_buf, LINK_HEADER_LEN + len);
     } else if (target == LINK_TX_TCP) {
-        send_bytes_tcp(buf, LINK_HEADER_LEN + len);
+        send_bytes_tcp(s_tx_buf, LINK_HEADER_LEN + len);
     }
+    xSemaphoreGive(s_tx_lock);
 }
 
 static void send_ack(uint16_t seq, const char *text)
@@ -235,7 +257,11 @@ static void send_error(uint16_t seq, const char *text)
 
 static void send_udp_payload(uint8_t stream_id, const void *payload, size_t len)
 {
-    if (len + 20 > LINK_UDP_MAX || s_udp_sock < 0 || s_udp_host == 0) {
+    if (len + 20 > LINK_UDP_MAX || s_udp_host == 0) {
+        return;
+    }
+    int udp_sock = ensure_udp_socket();
+    if (udp_sock < 0) {
         return;
     }
     uint8_t buf[LINK_UDP_MAX];
@@ -256,7 +282,7 @@ static void send_udp_payload(uint8_t stream_id, const void *payload, size_t len)
         .sin_port = htons(s_udp_tel_port),
         .sin_addr.s_addr = s_udp_host,
     };
-    (void)sendto(s_udp_sock, buf, len + 20, 0, (struct sockaddr *)&dst, sizeof(dst));
+    (void)sendto(udp_sock, buf, len + 20, 0, (struct sockaddr *)&dst, sizeof(dst));
 }
 
 static void send_status(uint16_t seq)
@@ -272,8 +298,12 @@ static void send_status(uint16_t seq)
     alarm_get_status(&alarm);
     storage_get_info(&storage);
 
-    char json[768];
-    int n = snprintf(json, sizeof(json),
+    char *json = malloc(MAMBA_LINK_MAX_PAYLOAD);
+    if (!json) {
+        send_error(seq, "no memory");
+        return;
+    }
+    int n = snprintf(json, MAMBA_LINK_MAX_PAYLOAD,
         "{\"fw\":\"%s\",\"proto\":%u,\"device\":\"%s\","
         "\"battery\":{\"i2c\":%s,\"capacity\":%u,\"fused_mv\":%lu,\"adc_mv\":%lu,\"current_ma\":%ld,\"temp_decic\":%d},"
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
@@ -292,10 +322,13 @@ static void send_status(uint16_t seq)
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
-    if (n > 0) {
+    if (n > 0 && (size_t)n < MAMBA_LINK_MAX_PAYLOAD) {
         send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_STATUS, seq, json, (size_t)n);
         send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_STATUS, seq, json, (size_t)n);
+    } else {
+        send_error(seq, "status too large");
     }
+    free(json);
 }
 
 static void close_upload(void)
@@ -501,7 +534,7 @@ static void handle_frame(const link_rx_frame_t *frame)
     }
 }
 
-static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len)
+static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len, bool from_usb)
 {
     for (size_t i = 0; i < len; ++i) {
         if (parser->len == 0 && data[i] != MAMBA_LINK_SYNC0) {
@@ -533,7 +566,9 @@ static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len)
                         .len = payload_len,
                     };
                     memcpy(frame.payload, parser->buffer + LINK_HEADER_LEN, payload_len);
-                    xQueueSend(s_rx_queue, &frame, 0);
+                    if (xQueueSend(s_rx_queue, &frame, 0) == pdTRUE && from_usb) {
+                        s_usb_rx_frames++;
+                    }
                 }
                 parser->len = 0;
             }
@@ -547,8 +582,12 @@ static void usb_rx_task(void *arg)
     uint8_t buf[128];
     while (true) {
         int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(100));
+        s_usb_rx_loops++;
         if (n > 0) {
-            parser_feed(&parser, buf, (size_t)n);
+            s_usb_rx_bytes += (uint32_t)n;
+            parser_feed(&parser, buf, (size_t)n, true);
+        } else {
+            s_usb_rx_empty++;
         }
     }
 }
@@ -569,7 +608,7 @@ static void tcp_rx_task(void *arg)
         }
         int n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
-            parser_feed(&parser, buf, (size_t)n);
+            parser_feed(&parser, buf, (size_t)n, false);
         } else {
             link_detach_tcp_socket(sock);
             vTaskDelay(pdMS_TO_TICKS(250));
@@ -591,6 +630,11 @@ static void hello_task(void *arg)
 {
     while (true) {
         if (s_udp_sock >= 0 && s_udp_host != 0) {
+            int udp_sock = ensure_udp_socket();
+            if (udp_sock < 0) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
             char hello[160];
             int n = snprintf(hello, sizeof(hello), "{\"fw\":\"%s\",\"proto\":%u,\"device\":\"%s\"}",
                              MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_config.device_name);
@@ -599,7 +643,7 @@ static void hello_task(void *arg)
                 .sin_port = htons(s_udp_hello_port),
                 .sin_addr.s_addr = s_udp_host,
             };
-            (void)sendto(s_udp_sock, hello, n, 0, (struct sockaddr *)&dst, sizeof(dst));
+            (void)sendto(udp_sock, hello, n, 0, (struct sockaddr *)&dst, sizeof(dst));
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -618,11 +662,15 @@ static void telemetry_task(void *arg)
             alarm_status_t alarm;
             battery_get_snapshot(&bat);
             alarm_get_status(&alarm);
-            char json[192];
+            char json[256];
             int n = snprintf(json, sizeof(json),
-                "{\"fused_mv\":%lu,\"adc_mv\":%lu,\"capacity\":%u,\"alarm\":%s,\"sample\":%lu}",
+                "{\"fused_mv\":%lu,\"adc_mv\":%lu,\"capacity\":%u,\"alarm\":%s,\"sample\":%lu,"
+                "\"usb_rx\":%lu,\"usb_frames\":%lu,\"usb_loops\":%lu,\"usb_empty\":%lu,\"heap\":%lu}",
                 (unsigned long)bat.fused_voltage_mv, (unsigned long)bat.adc_battery_mv,
-                bat.capacity_percent, alarm.active ? "true" : "false", (unsigned long)bat.sample_count);
+                bat.capacity_percent, alarm.active ? "true" : "false", (unsigned long)bat.sample_count,
+                (unsigned long)s_usb_rx_bytes, (unsigned long)s_usb_rx_frames,
+                (unsigned long)s_usb_rx_loops, (unsigned long)s_usb_rx_empty,
+                (unsigned long)esp_get_free_heap_size());
             if (n > 0) {
                 send_udp_payload(MAMBA_STREAM_BATTERY, json, (size_t)n);
                 send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
@@ -702,6 +750,9 @@ void link_set_udp_target(uint32_t host_ip_addr, uint16_t hello_port, uint16_t te
     s_udp_host = host_ip_addr;
     s_udp_hello_port = hello_port;
     s_udp_tel_port = telemetry_port;
+    if (host_ip_addr != 0) {
+        (void)ensure_udp_socket();
+    }
 }
 
 bool link_self_test(void)
@@ -718,18 +769,18 @@ esp_err_t link_init(const mamba_config_t *config)
         mamba_config_defaults(&s_config);
     }
     s_lock = xSemaphoreCreateMutex();
+    s_tx_lock = xSemaphoreCreateMutex();
     s_rx_queue = xQueueCreate(LINK_QUEUE_DEPTH, sizeof(link_rx_frame_t));
-    ESP_RETURN_ON_FALSE(s_lock && s_rx_queue, ESP_ERR_NO_MEM, TAG, "alloc");
+    ESP_RETURN_ON_FALSE(s_lock && s_tx_lock && s_rx_queue, ESP_ERR_NO_MEM, TAG, "alloc");
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    usb_cfg.rx_buffer_size = 2048;
-    usb_cfg.tx_buffer_size = 2048;
+    usb_cfg.rx_buffer_size = 512;
+    usb_cfg.tx_buffer_size = 512;
     esp_err_t err = usb_serial_jtag_driver_install(&usb_cfg);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "usb serial install failed: %s", esp_err_to_name(err));
     }
-    s_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 4096, NULL, 5, NULL);
-    ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 4096, NULL, 5, NULL);
+    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 6144, NULL, 5, NULL);
+    ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 6144, NULL, 5, NULL);
     ok &= xTaskCreate(command_task, "link_cmd", 4096, NULL, 5, NULL);
     ok &= xTaskCreate(hello_task, "link_hello", 3072, NULL, 3, NULL);
     ok &= xTaskCreate(telemetry_task, "link_tel", 4096, NULL, 3, NULL);

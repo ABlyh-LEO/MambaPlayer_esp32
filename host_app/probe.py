@@ -65,6 +65,31 @@ def udp_listen(port: int, timeout: float) -> int:
     return 0
 
 
+def wait_usb_ready(ser, parser: FrameParser, timeout: float) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = ser.read(512)
+        if parser.feed(data):
+            return
+
+
+def usb_status(port: str, baud: int, timeout: float) -> int:
+    if serial is None:
+        print("pyserial not installed", file=sys.stderr)
+        return 2
+    parser = FrameParser()
+    with serial.Serial(port, baud, timeout=0.1) as ser:
+        wait_usb_ready(ser, parser, timeout)
+        ser.write(encode_frame(TYPE_GET_STATUS, b"{}", 1))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = ser.read(512)
+            for frame in parser.feed(data):
+                print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
+                return 0
+    return 1
+
+
 def usb_wifi(port: str, ssid: str, password: str, baud: int, timeout: float) -> int:
     if serial is None:
         print("pyserial not installed", file=sys.stderr)
@@ -72,6 +97,7 @@ def usb_wifi(port: str, ssid: str, password: str, baud: int, timeout: float) -> 
     payload = json.dumps({"ssid": ssid, "password": password}).encode()
     parser = FrameParser()
     with serial.Serial(port, baud, timeout=0.1) as ser:
+        wait_usb_ready(ser, parser, timeout)
         ser.write(encode_frame(TYPE_WIFI_CONFIG, payload, 1))
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -106,6 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     p_udp = sub.add_parser("udp-once")
     p_udp.add_argument("--port", type=int, default=37212)
     p_udp.add_argument("--timeout", type=float, default=5.0)
+    p_usb_status = sub.add_parser("usb-status")
+    p_usb_status.add_argument("--port", required=True)
+    p_usb_status.add_argument("--baud", type=int, default=115200)
+    p_usb_status.add_argument("--timeout", type=float, default=5.0)
     p_usb = sub.add_parser("usb-wifi")
     p_usb.add_argument("--port", required=True)
     p_usb.add_argument("--ssid", required=True)
@@ -119,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         return tcp_status(args.host, args.port, args.timeout)
     if args.cmd == "udp-once":
         return udp_listen(args.port, args.timeout)
+    if args.cmd == "usb-status":
+        return usb_status(args.port, args.baud, args.timeout)
     if args.cmd == "usb-wifi":
         return usb_wifi(args.port, args.ssid, args.password, args.baud, args.timeout)
     if args.cmd == "snapshot":
