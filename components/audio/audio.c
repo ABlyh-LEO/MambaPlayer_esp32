@@ -15,6 +15,7 @@
 typedef enum {
     AUDIO_CMD_PLAY,
     AUDIO_CMD_TONE,
+    AUDIO_CMD_SINE_ALARM,
     AUDIO_CMD_STOP,
     AUDIO_CMD_RESET_OFFSET,
 } audio_cmd_type_t;
@@ -50,6 +51,11 @@ static const int16_t IMA_STEP_TABLE[89] = {
     2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
     5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
     15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+};
+
+static const int16_t SINE_1KHZ_16K[16] = {
+    0, 8419, 15556, 20333, 22000, 20333, 15556, 8419,
+    0, -8419, -15556, -20333, -22000, -20333, -15556, -8419,
 };
 
 static uint16_t le16(const uint8_t *p)
@@ -348,9 +354,18 @@ static void play_file(const char *path, uint32_t offset, bool loop)
     set_status(false, path, loop ? s_alarm_offset : pos, info.sample_rate_hz);
 }
 
-static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
+static int16_t sine_sample(uint32_t pos, uint32_t frequency_hz)
 {
-    if (duration_ms == 0 || duration_ms > 60000) {
+    if (frequency_hz == 1000 && MAMBA_AUDIO_SAMPLE_RATE_HZ == 16000) {
+        return SINE_1KHZ_16K[pos & 0x0f];
+    }
+    uint32_t phase = (pos * frequency_hz * 16) / MAMBA_AUDIO_SAMPLE_RATE_HZ;
+    return SINE_1KHZ_16K[phase & 0x0f];
+}
+
+static void play_tone(uint32_t duration_ms, uint32_t frequency_hz, bool loop)
+{
+    if (!loop && (duration_ms == 0 || duration_ms > 60000)) {
         duration_ms = 2000;
     }
     if (frequency_hz < 100 || frequency_hz > 4000) {
@@ -363,19 +378,15 @@ static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
     enum { TONE_FRAMES = 256 };
     int16_t stereo[TONE_FRAMES * 2];
     uint32_t total_frames = (MAMBA_AUDIO_SAMPLE_RATE_HZ * duration_ms) / 1000;
-    uint32_t half_period = MAMBA_AUDIO_SAMPLE_RATE_HZ / (frequency_hz * 2);
-    if (half_period == 0) {
-        half_period = 1;
-    }
-    set_status(true, "tone", 0, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+    set_status(true, loop ? "alarm_sine_1khz" : "tone_sine_1khz", 0, MAMBA_AUDIO_SAMPLE_RATE_HZ);
     s_stop_requested = false;
-    for (uint32_t pos = 0; pos < total_frames && !s_stop_requested;) {
-        uint32_t frames = total_frames - pos;
+    for (uint32_t pos = 0; (loop || pos < total_frames) && !s_stop_requested;) {
+        uint32_t frames = loop ? TONE_FRAMES : total_frames - pos;
         if (frames > TONE_FRAMES) {
             frames = TONE_FRAMES;
         }
         for (uint32_t i = 0; i < frames; ++i) {
-            int16_t sample = (((pos + i) / half_period) & 1) ? 22000 : -22000;
+            int16_t sample = sine_sample(pos + i, frequency_hz);
             stereo[i * 2] = sample;
             stereo[i * 2 + 1] = sample;
         }
@@ -384,11 +395,11 @@ static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
         esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 1000);
         note_i2s_write(requested, written, err);
         pos += frames;
-        set_status(true, "tone", pos, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+        set_status(true, loop ? "alarm_sine_1khz" : "tone_sine_1khz", pos, MAMBA_AUDIO_SAMPLE_RATE_HZ);
     }
     i2s_channel_disable(tx);
     i2s_del_channel(tx);
-    set_status(false, "tone", total_frames, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+    set_status(false, loop ? "alarm_sine_1khz" : "tone_sine_1khz", total_frames, MAMBA_AUDIO_SAMPLE_RATE_HZ);
 }
 
 static void audio_task(void *arg)
@@ -401,7 +412,9 @@ static void audio_task(void *arg)
         if (cmd.type == AUDIO_CMD_PLAY) {
             play_file(cmd.path, cmd.offset, cmd.loop);
         } else if (cmd.type == AUDIO_CMD_TONE) {
-            play_tone(cmd.duration_ms, cmd.frequency_hz);
+            play_tone(cmd.duration_ms, cmd.frequency_hz, false);
+        } else if (cmd.type == AUDIO_CMD_SINE_ALARM) {
+            play_tone(0, 1000, true);
         } else if (cmd.type == AUDIO_CMD_STOP) {
             s_stop_requested = true;
         } else if (cmd.type == AUDIO_CMD_RESET_OFFSET) {
@@ -413,10 +426,10 @@ static void audio_task(void *arg)
 esp_err_t audio_play_alarm(const char *path, uint32_t offset)
 {
     ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
+    (void)path;
+    (void)offset;
     s_stop_requested = true;
-    audio_cmd_t cmd = {.type = AUDIO_CMD_PLAY, .offset = offset};
-    cmd.loop = true;
-    strlcpy(cmd.path, path, sizeof(cmd.path));
+    audio_cmd_t cmd = {.type = AUDIO_CMD_SINE_ALARM};
     return xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(20)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
