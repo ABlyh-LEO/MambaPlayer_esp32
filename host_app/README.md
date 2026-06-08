@@ -26,13 +26,13 @@ connected, it uses the active TCP device connection.
 
 - The firmware sends a low-rate source catalog. The left table shows available
   keys, latest values, units and nominal source rates.
-- Add up to 16 source keys to the firmware channel list, then apply the 1 kHz
-  stream configuration. These are the only values sampled into the firmware-side
-  selected-values UDP stream.
-- Add any source key to the VOFA table. The host sends enabled VOFA rows at
-  1 kHz as JustFloat UDP frames.
-- VOFA+ defaults: remote IP `127.0.0.1`, remote port `1346`, local port `1347`.
-  Configure VOFA+ to receive JustFloat over UDP on the matching port.
+- Select a row in the source table, add up to 16 source keys to the Firmware
+  1 kHz table, then apply the stream configuration. These are the only values
+  sampled into the firmware-side selected-values UDP stream.
+- Select any source key and add it to the VOFA table. The host sends enabled
+  VOFA rows at 1 kHz as JustFloat UDP frames.
+- VOFA+ defaults: the host sends to `127.0.0.1:1347` and binds local UDP port
+  `1346`. Configure VOFA+ to receive JustFloat over UDP on port `1347`.
 - Project settings are saved as `host_app\runtime\last_project.mamba.json`.
   This stores VOFA address, firmware channels, CAN IDs, VOFA mappings and theme.
 

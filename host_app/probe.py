@@ -305,8 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     p_catalog.add_argument("--timeout", type=float, default=5.0)
     p_vofa = sub.add_parser("vofa-test")
     p_vofa.add_argument("--host", default="127.0.0.1")
-    p_vofa.add_argument("--remote-port", type=int, default=1346)
-    p_vofa.add_argument("--local-port", type=int, default=1347)
+    p_vofa.add_argument("--remote-port", type=int, default=1347)
+    p_vofa.add_argument("--local-port", type=int, default=1346)
     p_vofa.add_argument("values", nargs="*", type=float)
     args = parser.parse_args(argv)
     if args.cmd == "tcp-status":

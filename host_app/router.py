@@ -10,9 +10,10 @@ from pathlib import Path
 
 VOFA_TAIL = b"\x00\x00\x80\x7f"
 DEFAULT_PROJECT = {
+    "project_version": 2,
     "vofa_host": "127.0.0.1",
-    "vofa_remote_port": 1346,
-    "vofa_local_port": 1347,
+    "vofa_remote_port": 1347,
+    "vofa_local_port": 1346,
     "firmware_channels": [],
     "can_ids": [],
     "vofa_channels": [],
@@ -61,6 +62,11 @@ def load_project(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     project = dict(DEFAULT_PROJECT)
     project.update(data)
+    if int(data.get("project_version") or 0) < 2:
+        if int(project.get("vofa_remote_port") or 0) == 1346 and int(project.get("vofa_local_port") or 0) == 1347:
+            project["vofa_remote_port"] = 1347
+            project["vofa_local_port"] = 1346
+    project["project_version"] = DEFAULT_PROJECT["project_version"]
     return project
 
 

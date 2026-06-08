@@ -66,6 +66,14 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(loaded["firmware_channels"], ["adc.raw"])
             self.assertEqual(loaded["vofa_channels"][0]["index"], 5)
 
+    def test_legacy_vofa_port_defaults_are_migrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.mamba.json"
+            path.write_text('{"vofa_remote_port":1346,"vofa_local_port":1347}', encoding="utf-8")
+            loaded = load_project(path)
+            self.assertEqual(loaded["vofa_remote_port"], 1347)
+            self.assertEqual(loaded["vofa_local_port"], 1346)
+
 
 class AudioTests(unittest.TestCase):
     def test_adpcm_wav_header(self):

@@ -460,10 +460,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_ports()
         self.serial_button = QtWidgets.QPushButton("Connect USB")
         self.status_button = QtWidgets.QPushButton("Status")
-        controls.addWidget(QtWidgets.QLabel("VOFA Remote"))
+        controls.addWidget(QtWidgets.QLabel("Send to VOFA"))
         controls.addWidget(self.vofa_host)
         controls.addWidget(self.vofa_remote)
-        controls.addWidget(QtWidgets.QLabel("Local"))
+        controls.addWidget(QtWidgets.QLabel("Bind local"))
         controls.addWidget(self.vofa_local)
         controls.addWidget(self.serial_combo)
         controls.addWidget(self.serial_button)
@@ -472,10 +472,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter = QtWidgets.QSplitter()
         self.sources_table = self._table(["Key", "Name", "Value", "Unit", "Rate Hz"])
+        self.firmware_table = self._table(["Slot", "Source", "Latest"])
         self.channels_table = self._table(["VOFA Ch", "Source", "Label", "Latest"])
         self.can_table = self._table(["ID", "Timestamp us", "DLC", "Data", "Parser fields"])
+        middle = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        middle.addWidget(self.firmware_table)
+        middle.addWidget(self.channels_table)
+        middle.setSizes([260, 360])
         splitter.addWidget(self.sources_table)
-        splitter.addWidget(self.channels_table)
+        splitter.addWidget(middle)
         splitter.addWidget(self.can_table)
         splitter.setSizes([420, 420, 480])
         layout.addWidget(splitter, 1)
@@ -485,6 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vofa_index = QtWidgets.QSpinBox()
         self.vofa_index.setRange(0, 255)
         self.add_fw_button = QtWidgets.QPushButton("Add Firmware Ch")
+        self.remove_fw_button = QtWidgets.QPushButton("Remove Firmware Ch")
         self.apply_fw_button = QtWidgets.QPushButton("Apply Firmware 1kHz")
         self.add_vofa_button = QtWidgets.QPushButton("Add VOFA Ch")
         self.remove_vofa_button = QtWidgets.QPushButton("Remove VOFA Row")
@@ -495,6 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         route.addWidget(QtWidgets.QLabel("VOFA Ch"))
         route.addWidget(self.vofa_index)
         route.addWidget(self.add_fw_button)
+        route.addWidget(self.remove_fw_button)
         route.addWidget(self.apply_fw_button)
         route.addWidget(self.add_vofa_button)
         route.addWidget(self.remove_vofa_button)
@@ -541,6 +548,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_button.clicked.connect(lambda: self._connect_serial(self.serial_combo.currentData() or ""))
         self.status_button.clicked.connect(lambda: self._send(TYPE_GET_STATUS, b"{}"))
         self.add_fw_button.clicked.connect(self._add_firmware_channel)
+        self.remove_fw_button.clicked.connect(self._remove_firmware_channel)
         self.apply_fw_button.clicked.connect(self._apply_firmware_channels)
         self.add_vofa_button.clicked.connect(self._add_vofa_channel)
         self.remove_vofa_button.clicked.connect(self._remove_vofa_channel)
@@ -558,6 +566,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vofa_remote.setValue(int(self.project.get("vofa_remote_port", DEFAULT_PROJECT["vofa_remote_port"])))
         self.vofa_local.setValue(int(self.project.get("vofa_local_port", DEFAULT_PROJECT["vofa_local_port"])))
         self.can_ids_edit.setText(",".join(f"0x{can_id:03X}" for can_id in self.can_ids))
+        self._refresh_firmware_table()
         self._refresh_channels_table()
         self._refresh_sources_table()
 
@@ -618,6 +627,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, value in zip(self.firmware_channels, values):
             self.sources[key] = SourceValue(key=key, name=key, value=float(value), rate_hz=1000, updated_at=now)
             self.selected_values[key] = float(value)
+        self._refresh_firmware_table()
+        self._refresh_channels_table()
 
     def _handle_can(self, payload: bytes) -> None:
         try:
@@ -631,24 +642,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.sources[key] = SourceValue(key=key, name=key, value=value, rate_hz=1000)
         self._refresh_can_table()
         self._refresh_sources_table()
+        self._refresh_channels_table()
 
     def _refresh_sources_table(self) -> None:
         keys = sorted(self.sources)
+        selected_key = self._selected_source_key()
         self.sources_table.setRowCount(len(keys))
-        self.source_combo.blockSignals(True)
-        current = self.source_combo.currentText()
-        self.source_combo.clear()
+        selected_row = -1
         for row, key in enumerate(keys):
             source = self.sources[key]
             values = [source.key, source.name, f"{source.value:.6g}", source.unit, str(source.rate_hz)]
             for col, value in enumerate(values):
                 self.sources_table.setItem(row, col, QtWidgets.QTableWidgetItem(value))
-            self.source_combo.addItem(key)
-        if current:
-            index = self.source_combo.findText(current)
+            if key == selected_key:
+                selected_row = row
+        if selected_row >= 0:
+            self.sources_table.selectRow(selected_row)
+        combo_keys = [self.source_combo.itemData(i) for i in range(self.source_combo.count())]
+        if combo_keys != keys:
+            self.source_combo.blockSignals(True)
+            self.source_combo.clear()
+            for key in keys:
+                self.source_combo.addItem(key, key)
+            index = self.source_combo.findData(selected_key)
             if index >= 0:
                 self.source_combo.setCurrentIndex(index)
-        self.source_combo.blockSignals(False)
+            self.source_combo.blockSignals(False)
+
+    def _selected_source_key(self) -> str:
+        rows = self.sources_table.selectionModel().selectedRows() if self.sources_table.selectionModel() else []
+        if rows:
+            item = self.sources_table.item(rows[0].row(), 0)
+            if item:
+                return item.text()
+        data = self.source_combo.currentData()
+        return str(data or self.source_combo.currentText() or "")
+
+    def _refresh_firmware_table(self) -> None:
+        self.firmware_table.setRowCount(len(self.firmware_channels))
+        for row, source in enumerate(self.firmware_channels):
+            latest = self.sources.get(source, SourceValue(source, source)).value
+            values = [str(row), source, f"{latest:.6g}"]
+            for col, value in enumerate(values):
+                self.firmware_table.setItem(row, col, QtWidgets.QTableWidgetItem(value))
 
     def _refresh_channels_table(self) -> None:
         self.channels_table.blockSignals(True)
@@ -681,10 +717,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.can_table.setItem(row, col, QtWidgets.QTableWidgetItem(value))
 
     def _add_firmware_channel(self) -> None:
-        key = self.source_combo.currentText()
+        key = self._selected_source_key()
         if key and key not in self.firmware_channels and len(self.firmware_channels) < 16:
             self.firmware_channels.append(key)
+            self._refresh_firmware_table()
             self._log(f"firmware channel added: {key}")
+
+    def _remove_firmware_channel(self) -> None:
+        rows = sorted({item.row() for item in self.firmware_table.selectedItems()}, reverse=True)
+        for row in rows:
+            if 0 <= row < len(self.firmware_channels):
+                removed = self.firmware_channels.pop(row)
+                self._log(f"firmware channel removed: {removed}")
+        self._refresh_firmware_table()
 
     def _apply_firmware_channels(self) -> None:
         payload = json.dumps({"channels": self.firmware_channels}).encode()
@@ -699,7 +744,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"firmware channel apply failed: {exc}")
 
     def _add_vofa_channel(self) -> None:
-        key = self.source_combo.currentText()
+        key = self._selected_source_key()
         if not key:
             return
         self.vofa_channels.append({"index": self.vofa_index.value(), "source": key, "label": key, "enabled": True})
@@ -775,6 +820,8 @@ class MainWindow(QtWidgets.QMainWindow):
             key = f"can.0x201.{field}"
             self.sources[key] = SourceValue(key, key, "", value, 1000)
         self._refresh_sources_table()
+        self._refresh_firmware_table()
+        self._refresh_channels_table()
         self._refresh_can_table()
 
     def _toggle_mock(self, enabled: bool) -> None:

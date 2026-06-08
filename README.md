@@ -69,7 +69,8 @@ It manages source catalog, firmware 1 kHz channel selection, CAN forwarding,
 host-side CAN parsers, VOFA+ UDP JustFloat output, audio upload, Wi-Fi
 provisioning and Speaker Mode.
 
-VOFA+ output defaults to remote `127.0.0.1:1346` with local UDP port `1347`.
+VOFA+ output defaults to sending JustFloat UDP to `127.0.0.1:1347` while the
+host binds local UDP port `1346`.
 Frames are JustFloat: little-endian `float32[]` followed by `00 00 80 7F`.
 
 With VB-CABLE installed, Speaker Mode prefers `CABLE Output` capture while

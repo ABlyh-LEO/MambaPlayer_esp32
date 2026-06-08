@@ -1,7 +1,5 @@
 import os
-import tempfile
 import unittest
-from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -67,12 +65,24 @@ class HostGuiSmokeTests(unittest.TestCase):
             self.assertGreater(len(window.sources), 0)
             self.assertGreater(window.sources_table.rowCount(), 0)
             self.assertGreater(window.can_table.rowCount(), 0)
-            with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "hub.png"
-                image = window.grab().toImage()
-                self.assertFalse(image.isNull())
-                self.assertTrue(image.save(str(path)))
-                self.assertGreater(path.stat().st_size, 0)
+            image = window.grab().toImage()
+            self.assertFalse(image.isNull())
+            self.assertGreater(image.width() * image.height(), 0)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_source_selection_survives_mock_refresh(self):
+        window = MainWindow(start_workers=False)
+        try:
+            window._mock_tick()
+            self.app.processEvents()
+            index = window.source_combo.findData("justfloat.1")
+            self.assertGreaterEqual(index, 0)
+            window.source_combo.setCurrentIndex(index)
+            window._mock_tick()
+            self.app.processEvents()
+            self.assertEqual(window.source_combo.currentData(), "justfloat.1")
         finally:
             window.close()
             self.app.processEvents()
