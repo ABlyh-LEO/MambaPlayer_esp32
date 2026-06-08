@@ -13,6 +13,7 @@
 #include "can_monitor.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -595,10 +596,13 @@ static void handle_audio_stream_start(const link_rx_frame_t *frame)
     body[frame->len] = 0;
     uint32_t rate = MAMBA_AUDIO_SAMPLE_RATE_HZ;
     json_get_u32(body, "sample_rate", &rate);
-    if (audio_stream_start(rate) == ESP_OK) {
+    esp_err_t err = audio_stream_start(rate);
+    if (err == ESP_OK) {
         send_ack(frame->seq, "audio stream start");
     } else {
-        send_error(frame->seq, "audio stream start failed");
+        char text[64];
+        snprintf(text, sizeof(text), "audio stream start failed: %s", esp_err_to_name(err));
+        send_error(frame->seq, text);
     }
 }
 

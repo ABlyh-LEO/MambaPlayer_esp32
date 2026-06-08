@@ -33,6 +33,13 @@ static bool should_exit(const battery_snapshot_t *bat, const mamba_config_t *cfg
     return !cfg->alarm_enabled || (voltage_ok && cap_ok);
 }
 
+static bool power_on_audio_playing(void)
+{
+    audio_status_t audio = {0};
+    audio_get_status(&audio);
+    return audio.playing && strcmp(audio.file, s_config.power_on_file) == 0;
+}
+
 bool alarm_self_test(void)
 {
     mamba_config_t cfg;
@@ -78,6 +85,11 @@ static void alarm_task(void *arg)
                 if (st.enter_candidate_ms == 0) {
                     st.enter_candidate_ms = now;
                 } else if (now - st.enter_candidate_ms >= 2500) {
+                    if (power_on_audio_playing()) {
+                        publish(&st);
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        continue;
+                    }
                     st.active = true;
                     st.exit_candidate_ms = 0;
                     st.transitions++;
