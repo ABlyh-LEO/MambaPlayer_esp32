@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio_tools import TARGET_RATE, convert_to_mamba_wav
+from .audio_tools import TARGET_RATE, convert_to_mamba_wav, normalize_peak
 from .mamba_link import (
     STREAM_JUSTFLOAT,
     TYPE_HELLO,
@@ -16,6 +16,8 @@ from .mamba_link import (
     decode_udp_packet,
     encode_frame,
     parse_justfloat_payload,
+    parse_adc_batch_payload,
+    parse_rm_motor_payload,
 )
 
 
@@ -41,6 +43,27 @@ class ProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(parsed["values"][0], 1.25)
         self.assertAlmostEqual(parsed["values"][1], -2.5)
 
+    def test_batched_adc_payload(self):
+        payload = struct.pack("<IIHHIHHIHH", 10, 2000, 2, 1, 22000, 2000, 1234, 22100, 2010, 1235)
+        parsed = parse_adc_batch_payload(payload)
+        self.assertEqual(parsed["samples"][0]["sample"], 10)
+        self.assertEqual(parsed["samples"][1]["battery_mv"], 22100)
+        self.assertEqual(parsed["dropped"], 1)
+
+    def test_batched_justfloat_payload(self):
+        payload = struct.pack("<HHQBBHff", 1, 0, 1234, 2, 0, 0, 1.0, -1.0)
+        parsed = parse_justfloat_payload(payload)
+        self.assertEqual(len(parsed["frames"]), 1)
+        self.assertEqual(parsed["frames"][0]["values"][0], 1.0)
+
+    def test_batched_rm_motor_payload(self):
+        payload = bytearray(28)
+        struct.pack_into("<HH", payload, 0, 1, 0)
+        struct.pack_into("<QBBBBHhhhI", payload, 4, 1000, 1, 55, 0, 0, 123, -100, 42, -9, 0)
+        parsed = parse_rm_motor_payload(bytes(payload))
+        self.assertEqual(parsed["motors"][0]["motor_id"], 1)
+        self.assertEqual(parsed["motors"][0]["rpm"], -100)
+
 
 class AudioTests(unittest.TestCase):
     def test_adpcm_wav_header(self):
@@ -64,6 +87,12 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<H", data, 20)[0], 0x0011)
         self.assertEqual(struct.unpack_from("<I", data, 24)[0], TARGET_RATE)
         self.assertEqual(data[40:44], b"fact")
+
+    def test_peak_normalize(self):
+        samples = np.array([0.0, 0.1, -0.2], dtype=np.float32)
+        normalized, gain = normalize_peak(samples)
+        self.assertGreater(gain, 1.0)
+        self.assertAlmostEqual(float(np.max(np.abs(normalized))), 0.98, places=5)
 
 
 if __name__ == "__main__":

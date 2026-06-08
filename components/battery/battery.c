@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "telemetry_mux.h"
 
 enum {
     REG_DESIGNED_CAPACITY = 0x20,
@@ -136,10 +137,22 @@ static void battery_task(void *arg)
 {
     battery_snapshot_t snap = {0};
     int64_t last_static_us = 0;
+    int64_t last_i2c_dynamic_us = 0;
     while (true) {
         update_adc(&snap);
-        update_i2c_dynamic(&snap);
         int64_t now = esp_timer_get_time();
+        telemetry_adc_sample_t adc = {
+            .sample_index = snap.sample_count,
+            .battery_mv = snap.adc_battery_mv,
+            .pin_mv = (uint16_t)snap.adc_pin_mv,
+            .raw = (uint16_t)snap.adc_raw,
+            .timestamp_us = (uint64_t)now,
+        };
+        telemetry_mux_publish_adc(&adc);
+        if (now - last_i2c_dynamic_us > 500000) {
+            update_i2c_dynamic(&snap);
+            last_i2c_dynamic_us = now;
+        }
         if (snap.who_am_i_ok && now - last_static_us > 3000000) {
             update_i2c_static(&snap);
             last_static_us = now;
@@ -147,7 +160,7 @@ static void battery_task(void *arg)
         snap.fused_voltage_mv = snap.i2c_voltage_mv > 0 ? (uint32_t)snap.i2c_voltage_mv : snap.adc_battery_mv;
         snap.sample_count++;
         publish_snapshot(&snap);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 

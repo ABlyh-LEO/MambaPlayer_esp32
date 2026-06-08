@@ -13,6 +13,7 @@ BLOCK_ALIGN = 256
 SAMPLES_PER_BLOCK = (BLOCK_ALIGN - 4) * 2 + 1
 BYTES_PER_SECOND = math.ceil(TARGET_RATE * BLOCK_ALIGN / SAMPLES_PER_BLOCK)
 POWER_ON_MAX_SECONDS = 10.0
+NORMALIZE_TARGET_PEAK = 0.98
 
 IMA_INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
 IMA_STEP_TABLE = [
@@ -67,6 +68,18 @@ def _resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int = TARGET_
     return np.interp(dst_x, src_x, samples).astype(np.float32)
 
 
+def normalize_peak(samples: np.ndarray, target_peak: float = NORMALIZE_TARGET_PEAK) -> tuple[np.ndarray, float]:
+    if len(samples) == 0:
+        return samples, 1.0
+    peak = float(np.max(np.abs(samples)))
+    if not np.isfinite(peak) or peak <= 1e-6:
+        return samples, 1.0
+    gain = min(target_peak / peak, 64.0)
+    if gain <= 1.001:
+        return samples, 1.0
+    return np.clip(samples * gain, -target_peak, target_peak).astype(np.float32), gain
+
+
 def _encode_nibble(sample: int, state: dict[str, int]) -> int:
     step = IMA_STEP_TABLE[state["index"]]
     diff = sample - state["predictor"]
@@ -115,12 +128,18 @@ def _encode_adpcm_blocks(samples: np.ndarray) -> bytes:
     return bytes(out)
 
 
-def convert_to_mamba_wav(path: str | Path, max_seconds: float) -> bytes:
+def convert_to_mamba_wav(path: str | Path, max_seconds: float, trim: bool = False,
+                         normalize: bool = True, return_info: bool = False):
     samples, rate = _load_audio(path)
     duration = len(samples) / float(rate)
     if duration > max_seconds:
-        raise ValueError(f"audio too long: {duration:.1f}s > {max_seconds:.1f}s")
+        if not trim:
+            raise ValueError(f"audio too long: {duration:.1f}s > {max_seconds:.1f}s")
+        samples = samples[:int(max_seconds * rate)]
     samples = _resample_linear(samples, rate, TARGET_RATE)
+    gain = 1.0
+    if normalize:
+        samples, gain = normalize_peak(samples)
     data = _encode_adpcm_blocks(samples)
     file_size = 60 + len(data)
     header = bytearray()
@@ -133,4 +152,8 @@ def convert_to_mamba_wav(path: str | Path, max_seconds: float) -> bytes:
     header += struct.pack("<II", 4, len(samples))
     header += b"data"
     header += struct.pack("<I", len(data))
-    return bytes(header) + data
+    wav = bytes(header) + data
+    if return_info:
+        gain_db = 20.0 * math.log10(gain) if gain > 0 else 0.0
+        return wav, {"gain": gain, "gain_db": gain_db, "samples": len(samples)}
+    return wav

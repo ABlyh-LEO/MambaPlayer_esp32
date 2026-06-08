@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mamba_config.h"
+#include "telemetry_mux.h"
 
 #define CAN_QUEUE_DEPTH 64
 
@@ -24,10 +25,73 @@ static QueueHandle_t s_rx_queue;
 static SemaphoreHandle_t s_lock;
 static twai_node_handle_t s_node;
 static can_monitor_snapshot_t s_snapshot;
+static bool s_can_raw_enabled = true;
+static bool s_dji_parse_enabled = true;
+static char s_filter[96] = "0x201-0x208,0x200,0x1FF";
 
 static int16_t be_i16(const uint8_t *p)
 {
     return (int16_t)((uint16_t)p[0] << 8 | p[1]);
+}
+
+static uint32_t parse_id_token(const char *text, const char **end)
+{
+    while (*text == ' ' || *text == ',') {
+        text++;
+    }
+    uint32_t value = 0;
+    int base = 10;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        text += 2;
+    }
+    while ((*text >= '0' && *text <= '9') ||
+           (base == 16 && ((*text >= 'a' && *text <= 'f') || (*text >= 'A' && *text <= 'F')))) {
+        uint8_t digit = 0;
+        if (*text >= '0' && *text <= '9') {
+            digit = (uint8_t)(*text - '0');
+        } else if (*text >= 'a' && *text <= 'f') {
+            digit = (uint8_t)(*text - 'a' + 10);
+        } else {
+            digit = (uint8_t)(*text - 'A' + 10);
+        }
+        value = value * (uint32_t)base + digit;
+        text++;
+    }
+    if (end) {
+        *end = text;
+    }
+    return value;
+}
+
+static bool can_id_allowed(uint32_t id)
+{
+    if (s_filter[0] == '\0') {
+        return true;
+    }
+    const char *p = s_filter;
+    while (*p) {
+        const char *after_start = NULL;
+        uint32_t start = parse_id_token(p, &after_start);
+        if (after_start == p) {
+            break;
+        }
+        uint32_t end = start;
+        if (*after_start == '-') {
+            const char *after_end = NULL;
+            end = parse_id_token(after_start + 1, &after_end);
+            after_start = after_end;
+        }
+        if (id >= start && id <= end) {
+            return true;
+        }
+        p = strchr(after_start, ',');
+        if (!p) {
+            break;
+        }
+        p++;
+    }
+    return false;
 }
 
 bool can_monitor_parse_rm_feedback(uint32_t id, const uint8_t data[8], rm_motor_state_t *out)
@@ -102,11 +166,34 @@ static void process_frame(const twai_rx_item_t *item)
     if (!item->frame.header.ide && item->frame.header.dlc >= 8) {
         if (id >= 0x201 && id <= 0x208) {
             can_monitor_parse_rm_feedback(id, item->data, &s_snapshot.motors[id - 0x201]);
+            if (s_dji_parse_enabled) {
+                rm_motor_state_t *m = &s_snapshot.motors[id - 0x201];
+                telemetry_rm_motor_t rm = {
+                    .motor_id = (uint8_t)(id - 0x200),
+                    .angle = m->angle,
+                    .rpm = m->rpm,
+                    .torque_current = m->torque_current,
+                    .commanded_current = m->commanded_current,
+                    .temperature = m->temperature,
+                    .error = m->error,
+                    .timestamp_us = item->frame.header.timestamp,
+                };
+                telemetry_mux_publish_rm_motor(&rm);
+            }
         } else {
             parse_control_frame_locked(id, item->data);
         }
     }
     xSemaphoreGive(s_lock);
+    if (s_can_raw_enabled && can_id_allowed(id)) {
+        telemetry_can_frame_t frame = {
+            .id = id,
+            .dlc = item->frame.header.dlc > MAMBA_TELEM_CAN_MAX_DATA ? MAMBA_TELEM_CAN_MAX_DATA : item->frame.header.dlc,
+            .timestamp_us = item->frame.header.timestamp,
+        };
+        memcpy(frame.data, item->data, frame.dlc);
+        telemetry_mux_publish_can(&frame);
+    }
 }
 
 static void can_task(void *arg)
@@ -136,6 +223,16 @@ bool can_monitor_receive_frame(can_raw_frame_t *out, uint32_t timeout_ms)
     memcpy(out->data, item.data, out->dlc);
     out->timestamp_us = item.frame.header.timestamp;
     return true;
+}
+
+void can_monitor_apply_config(const mamba_config_t *config)
+{
+    if (!config) {
+        return;
+    }
+    s_can_raw_enabled = config->can_raw_enabled;
+    s_dji_parse_enabled = config->dji_motor_parse_enabled;
+    strlcpy(s_filter, config->can_filter, sizeof(s_filter));
 }
 
 void can_monitor_get_snapshot(can_monitor_snapshot_t *out)
@@ -194,6 +291,8 @@ esp_err_t can_monitor_init(uint32_t bitrate)
     ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "twai enable");
     s_snapshot.started = true;
     s_snapshot.bitrate = bitrate;
+    s_can_raw_enabled = true;
+    s_dji_parse_enabled = true;
     BaseType_t ok = xTaskCreate(can_task, "can_rx_task", 4096, s_telemetry_queue, 6, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "can task");
     ESP_LOGI(TAG, "TWAI listen-only started at %lu bps, parser self-test=%s",

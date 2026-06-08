@@ -10,6 +10,7 @@
 #include "alarm.h"
 #include "audio.h"
 #include "battery.h"
+#include "can_monitor.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -22,6 +23,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "storage.h"
+#include "telemetry_mux.h"
 
 #define LINK_QUEUE_DEPTH 8
 #define LINK_HEADER_LEN 12
@@ -105,6 +107,38 @@ static void put32(uint8_t *p, uint32_t v)
     p[1] = (v >> 8) & 0xff;
     p[2] = (v >> 16) & 0xff;
     p[3] = (v >> 24) & 0xff;
+}
+
+static void put64(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; ++i) {
+        p[i] = (uint8_t)(v >> (i * 8));
+    }
+}
+
+static bool json_get_bool(const char *json, const char *key, bool *out)
+{
+    const char *p = strstr(json, key);
+    if (!p || !out) {
+        return false;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '"') {
+        p++;
+    }
+    if (strncmp(p, "true", 4) == 0 || *p == '1') {
+        *out = true;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0 || *p == '0') {
+        *out = false;
+        return true;
+    }
+    return false;
 }
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
@@ -321,7 +355,8 @@ static void send_status(uint16_t seq)
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
         "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\","
         "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu}},"
-        "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu},"
+        "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
+        "\"raw\":%s,\"dji_parse\":%s,\"filter\":\"%s\"},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
         "\"wifi\":{\"ssid\":\"%s\",\"tcp_port\":%u,\"udp_hello\":%u,\"udp_telemetry\":%u}}",
         MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_config.device_name,
@@ -336,6 +371,8 @@ static void send_status(uint16_t seq)
         (unsigned long)audio.last_write_bytes,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
+        s_config.can_raw_enabled ? "true" : "false",
+        s_config.dji_motor_parse_enabled ? "true" : "false", s_config.can_filter,
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
     if (n > 0 && (size_t)n < MAMBA_LINK_MAX_PAYLOAD) {
@@ -383,6 +420,13 @@ static void handle_audio_begin(const link_rx_frame_t *frame)
     close_upload();
     strlcpy(s_upload.tmp_path, alarm ? "/spiffs/alarm.tmp" : "/spiffs/poweron.tmp", sizeof(s_upload.tmp_path));
     strlcpy(s_upload.final_path, alarm ? MAMBA_DEFAULT_ALARM_FILE : MAMBA_DEFAULT_POWER_ON_FILE, sizeof(s_upload.final_path));
+    storage_info_t info = {0};
+    if (storage_get_info(&info) == ESP_OK && info.total_bytes > info.used_bytes) {
+        uint32_t free_bytes = info.total_bytes - info.used_bytes;
+        if (free_bytes < expected + MAMBA_WAV_HEADER_ALLOWANCE_BYTES) {
+            unlink(s_upload.final_path);
+        }
+    }
     s_upload.alarm = alarm;
     s_upload.expected = expected;
     s_upload.max_file = max_file;
@@ -474,6 +518,17 @@ static void handle_set_config(const link_rx_frame_t *frame)
     if (json_get_u32(body, "telemetry_interval_ms", &u32) && u32 >= 20 && u32 <= 2000) {
         s_config.telemetry_interval_ms = u32;
     }
+    bool b;
+    if (json_get_bool(body, "can_raw_enabled", &b)) {
+        s_config.can_raw_enabled = b;
+    }
+    if (json_get_bool(body, "dji_motor_parse_enabled", &b)) {
+        s_config.dji_motor_parse_enabled = b;
+    }
+    char filter[sizeof(s_config.can_filter)] = {0};
+    if (json_get_string(body, "can_filter", filter, sizeof(filter))) {
+        strlcpy(s_config.can_filter, filter, sizeof(s_config.can_filter));
+    }
     if (json_get_u32(body, "low_voltage_enter_mv", &u32)) {
         s_config.low_voltage_enter_mv = u32;
     }
@@ -484,6 +539,7 @@ static void handle_set_config(const link_rx_frame_t *frame)
         s_config.adc_calibration_factor = f;
     }
     storage_save_config(&s_config);
+    can_monitor_apply_config(&s_config);
     if (s_config_cb) {
         s_config_cb(&s_config);
     }
@@ -515,6 +571,7 @@ static void handle_audio_test(const link_rx_frame_t *frame)
 {
     if (bytes_contains(frame->payload, frame->len, "stop")) {
         audio_stop_and_save_offset();
+        audio_stream_stop();
     } else if (bytes_contains(frame->payload, frame->len, "tone30")) {
         audio_play_tone(30000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "tone")) {
@@ -525,6 +582,38 @@ static void handle_audio_test(const link_rx_frame_t *frame)
         audio_play_alarm(s_config.alarm_file, audio_get_alarm_offset());
     }
     send_ack(frame->seq, "audio command");
+}
+
+static void handle_audio_stream_start(const link_rx_frame_t *frame)
+{
+    char body[MAMBA_LINK_MAX_PAYLOAD + 1];
+    memcpy(body, frame->payload, frame->len);
+    body[frame->len] = 0;
+    uint32_t rate = MAMBA_AUDIO_SAMPLE_RATE_HZ;
+    json_get_u32(body, "sample_rate", &rate);
+    if (audio_stream_start(rate) == ESP_OK) {
+        send_ack(frame->seq, "audio stream start");
+    } else {
+        send_error(frame->seq, "audio stream start failed");
+    }
+}
+
+static void handle_audio_stream_pcm(const link_rx_frame_t *frame)
+{
+    if ((frame->len % sizeof(int16_t)) != 0) {
+        send_error(frame->seq, "bad pcm chunk");
+        return;
+    }
+    esp_err_t err = audio_stream_write_pcm((const int16_t *)frame->payload, frame->len / sizeof(int16_t));
+    if (err != ESP_OK) {
+        send_error(frame->seq, "pcm write failed");
+    }
+}
+
+static void handle_audio_stream_stop(const link_rx_frame_t *frame)
+{
+    audio_stream_stop();
+    send_ack(frame->seq, "audio stream stop");
 }
 
 static void handle_frame(const link_rx_frame_t *frame)
@@ -551,6 +640,15 @@ static void handle_frame(const link_rx_frame_t *frame)
         break;
     case MAMBA_LINK_TYPE_AUDIO_TEST:
         handle_audio_test(frame);
+        break;
+    case MAMBA_LINK_TYPE_AUDIO_STREAM_START:
+        handle_audio_stream_start(frame);
+        break;
+    case MAMBA_LINK_TYPE_AUDIO_STREAM_PCM:
+        handle_audio_stream_pcm(frame);
+        break;
+    case MAMBA_LINK_TYPE_AUDIO_STREAM_STOP:
+        handle_audio_stream_stop(frame);
         break;
     default:
         send_error(frame->seq, "unknown type");
@@ -673,73 +771,150 @@ static void hello_task(void *arg)
     }
 }
 
+static void publish_adc_batch(void)
+{
+    telemetry_adc_sample_t samples[8];
+    uint16_t count = 0;
+    while (count < 8 && telemetry_mux_receive_adc(&samples[count], 0)) {
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    uint8_t payload[12 + 8 * 8];
+    put32(payload, samples[0].sample_index);
+    uint32_t interval = count > 1 ? (uint32_t)(samples[1].timestamp_us - samples[0].timestamp_us) : 2000;
+    put32(payload + 4, interval);
+    put16(payload + 8, count);
+    put16(payload + 10, (uint16_t)(telemetry_mux_dropped_adc() > 0xffff ? 0xffff : telemetry_mux_dropped_adc()));
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t *p = payload + 12 + i * 8;
+        put32(p, samples[i].battery_mv);
+        put16(p + 4, samples[i].pin_mv);
+        put16(p + 6, samples[i].raw);
+    }
+    send_udp_payload(MAMBA_STREAM_ADC_BATCH, payload, 12 + count * 8);
+}
+
+static void publish_can_batch(void)
+{
+    telemetry_can_frame_t frames[32];
+    uint16_t count = 0;
+    while (count < 32 && telemetry_mux_receive_can(&frames[count], 0)) {
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    uint8_t payload[4 + 32 * 24];
+    put16(payload, count);
+    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_can() > 0xffff ? 0xffff : telemetry_mux_dropped_can()));
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t *p = payload + 4 + i * 24;
+        put32(p, frames[i].id);
+        p[4] = frames[i].dlc;
+        p[5] = p[6] = p[7] = 0;
+        put64(p + 8, frames[i].timestamp_us);
+        memset(p + 16, 0, 8);
+        memcpy(p + 16, frames[i].data, frames[i].dlc > 8 ? 8 : frames[i].dlc);
+    }
+    send_udp_payload(MAMBA_STREAM_CAN_RAW, payload, 4 + count * 24);
+}
+
+static void publish_rm_batch(void)
+{
+    telemetry_rm_motor_t motors[16];
+    uint16_t count = 0;
+    while (count < 16 && telemetry_mux_receive_rm_motor(&motors[count], 0)) {
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    uint8_t payload[4 + 16 * 24];
+    put16(payload, count);
+    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_rm_motor() > 0xffff ? 0xffff : telemetry_mux_dropped_rm_motor()));
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t *p = payload + 4 + i * 24;
+        put64(p, motors[i].timestamp_us);
+        p[8] = motors[i].motor_id;
+        p[9] = motors[i].temperature;
+        p[10] = motors[i].error;
+        p[11] = 0;
+        put16(p + 12, motors[i].angle);
+        put16(p + 14, (uint16_t)motors[i].rpm);
+        put16(p + 16, (uint16_t)motors[i].torque_current);
+        put16(p + 18, (uint16_t)motors[i].commanded_current);
+        put32(p + 20, 0);
+    }
+    send_udp_payload(MAMBA_STREAM_RM_MOTOR, payload, 4 + count * 24);
+}
+
+static void publish_justfloat_batch(void)
+{
+    uint8_t payload[900];
+    uint16_t frames = 0;
+    size_t used = 4;
+    telemetry_justfloat_frame_t frame;
+    while (frames < 8 && telemetry_mux_receive_justfloat(&frame, 0)) {
+        size_t need = 12 + frame.count * sizeof(float);
+        if (frame.count > MAMBA_TELEM_JUSTFLOAT_MAX || used + need > sizeof(payload)) {
+            break;
+        }
+        uint8_t *p = payload + used;
+        put64(p, frame.timestamp_us);
+        p[8] = frame.count;
+        p[9] = 0;
+        put16(p + 10, 0);
+        memcpy(p + 12, frame.values, frame.count * sizeof(float));
+        used += need;
+        frames++;
+    }
+    if (frames == 0) {
+        return;
+    }
+    put16(payload, frames);
+    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_justfloat() > 0xffff ? 0xffff : telemetry_mux_dropped_justfloat()));
+    send_udp_payload(MAMBA_STREAM_JUSTFLOAT, payload, used);
+}
+
+static void publish_low_rate_status(uint32_t tick)
+{
+    if ((tick % 250) != 0) {
+        return;
+    }
+    battery_snapshot_t bat;
+    alarm_status_t alarm;
+    battery_get_snapshot(&bat);
+    alarm_get_status(&alarm);
+    char json[256];
+    int n = snprintf(json, sizeof(json),
+        "{\"fused_mv\":%lu,\"adc_mv\":%lu,\"capacity\":%u,\"alarm\":%s,\"sample\":%lu,"
+        "\"usb_rx\":%lu,\"usb_frames\":%lu,\"usb_loops\":%lu,\"usb_empty\":%lu,\"heap\":%lu}",
+        (unsigned long)bat.fused_voltage_mv, (unsigned long)bat.adc_battery_mv,
+        bat.capacity_percent, alarm.active ? "true" : "false", (unsigned long)bat.sample_count,
+        (unsigned long)s_usb_rx_bytes, (unsigned long)s_usb_rx_frames,
+        (unsigned long)s_usb_rx_loops, (unsigned long)s_usb_rx_empty,
+        (unsigned long)esp_get_free_heap_size());
+    if (n > 0) {
+        send_udp_payload(MAMBA_STREAM_BATTERY, json, (size_t)n);
+        if (!s_upload_active) {
+            send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
+        }
+    }
+}
+
 static void telemetry_task(void *arg)
 {
     uint32_t tick = 0;
     while (true) {
-        can_raw_frame_t frame;
-        while (can_monitor_receive_frame(&frame, 0)) {
-            link_publish_can_frame(&frame);
-        }
-        if ((tick++ % 10) == 0) {
-            battery_snapshot_t bat;
-            alarm_status_t alarm;
-            battery_get_snapshot(&bat);
-            alarm_get_status(&alarm);
-            char json[256];
-            int n = snprintf(json, sizeof(json),
-                "{\"fused_mv\":%lu,\"adc_mv\":%lu,\"capacity\":%u,\"alarm\":%s,\"sample\":%lu,"
-                "\"usb_rx\":%lu,\"usb_frames\":%lu,\"usb_loops\":%lu,\"usb_empty\":%lu,\"heap\":%lu}",
-                (unsigned long)bat.fused_voltage_mv, (unsigned long)bat.adc_battery_mv,
-                bat.capacity_percent, alarm.active ? "true" : "false", (unsigned long)bat.sample_count,
-                (unsigned long)s_usb_rx_bytes, (unsigned long)s_usb_rx_frames,
-                (unsigned long)s_usb_rx_loops, (unsigned long)s_usb_rx_empty,
-                (unsigned long)esp_get_free_heap_size());
-            if (n > 0) {
-                send_udp_payload(MAMBA_STREAM_BATTERY, json, (size_t)n);
-                if (!s_upload_active) {
-                    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
-                    send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(s_config.telemetry_interval_ms > 0 ? s_config.telemetry_interval_ms : 100));
+        publish_adc_batch();
+        publish_can_batch();
+        publish_rm_batch();
+        publish_justfloat_batch();
+        publish_low_rate_status(tick++);
+        vTaskDelay(pdMS_TO_TICKS(4));
     }
-}
-
-void link_publish_can_frame(const can_raw_frame_t *frame)
-{
-    if (!frame) {
-        return;
-    }
-    uint8_t payload[32];
-    put32(payload, frame->id);
-    payload[4] = frame->dlc;
-    payload[5] = 0;
-    payload[6] = 0;
-    payload[7] = 0;
-    memcpy(payload + 8, &frame->timestamp_us, sizeof(frame->timestamp_us));
-    memset(payload + 16, 0, 8);
-    memcpy(payload + 16, frame->data, frame->dlc > 8 ? 8 : frame->dlc);
-    send_udp_payload(MAMBA_STREAM_CAN_RAW, payload, 24);
-    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, payload, 24);
-    send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, payload, 24);
-}
-
-void link_publish_justfloat(const float *values, uint8_t count, uint32_t dropped_count)
-{
-    if (!values || count == 0 || count > 16) {
-        return;
-    }
-    uint8_t payload[8 + sizeof(float) * 16];
-    payload[0] = count;
-    payload[1] = 0;
-    put16(payload + 2, 0);
-    put32(payload + 4, dropped_count);
-    memcpy(payload + 8, values, sizeof(float) * count);
-    send_udp_payload(MAMBA_STREAM_JUSTFLOAT, payload, 8 + sizeof(float) * count);
-    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, payload, 8 + sizeof(float) * count);
-    send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, payload, 8 + sizeof(float) * count);
 }
 
 void link_set_config_updated_callback(mamba_link_config_updated_cb_t cb)

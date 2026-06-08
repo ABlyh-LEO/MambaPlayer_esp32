@@ -3,3 +3,4 @@ pyqtgraph>=0.13
 pyserial>=3.5
 numpy>=1.24
 soundfile>=0.12
+sounddevice>=0.4

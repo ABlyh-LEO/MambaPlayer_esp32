@@ -49,7 +49,7 @@ except ImportError:
 AUDIO_CHUNK_SIZE = 384
 AUDIO_HEADER_ALLOWANCE_BYTES = 4096
 AUDIO_STORAGE_SAFETY_BYTES = 32 * 1024
-DEFAULT_SPIFFS_TOTAL_BYTES = 1_739_681
+DEFAULT_SPIFFS_TOTAL_BYTES = 2_218_000
 
 
 def tcp_status(host: str, port: int, timeout: float) -> int:
@@ -165,7 +165,8 @@ def alarm_max_seconds_from_status(status: dict) -> float:
     return max(1.0, alarm_bytes / float(BYTES_PER_SECOND))
 
 
-def usb_upload_audio(port: str, kind: str, path: str, baud: int, timeout: float, max_seconds: float | None) -> int:
+def usb_upload_audio(port: str, kind: str, path: str, baud: int, timeout: float,
+                     max_seconds: float | None, trim: bool) -> int:
     if serial is None:
         print("pyserial not installed", file=sys.stderr)
         return 2
@@ -179,7 +180,7 @@ def usb_upload_audio(port: str, kind: str, path: str, baud: int, timeout: float,
         limit = max_seconds
         if limit is None:
             limit = POWER_ON_MAX_SECONDS if kind == "poweron" else alarm_max_seconds_from_status(status)
-        wav = convert_to_mamba_wav(path, max_seconds=limit)
+        wav = convert_to_mamba_wav(path, max_seconds=limit, trim=trim)
         begin = json.dumps({"kind": kind, "size": len(wav)}).encode()
         seq = 2
         send_wait_usb(ser, parser, TYPE_AUDIO_BEGIN, begin, seq, timeout)
@@ -240,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     p_upload.add_argument("--baud", type=int, default=115200)
     p_upload.add_argument("--timeout", type=float, default=5.0)
     p_upload.add_argument("--max-seconds", type=float)
+    p_upload.add_argument("--trim", action="store_true")
     p_snapshot = sub.add_parser("snapshot")
     p_snapshot.add_argument("--path")
     args = parser.parse_args(argv)
@@ -252,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "usb-wifi":
         return usb_wifi(args.port, args.ssid, args.password, args.baud, args.timeout)
     if args.cmd == "usb-upload-audio":
-        return usb_upload_audio(args.port, args.kind, args.file, args.baud, args.timeout, args.max_seconds)
+        return usb_upload_audio(args.port, args.kind, args.file, args.baud, args.timeout, args.max_seconds, args.trim)
     if args.cmd == "snapshot":
         return snapshot(args.path)
     return 2

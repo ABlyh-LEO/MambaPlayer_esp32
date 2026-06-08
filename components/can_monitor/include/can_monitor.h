@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "mamba_config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,7 @@ typedef struct {
 } can_monitor_snapshot_t;
 
 esp_err_t can_monitor_init(uint32_t bitrate);
+void can_monitor_apply_config(const mamba_config_t *config);
 void can_monitor_get_snapshot(can_monitor_snapshot_t *out);
 bool can_monitor_receive_frame(can_raw_frame_t *out, uint32_t timeout_ms);
 bool can_monitor_parse_rm_feedback(uint32_t id, const uint8_t data[8], rm_motor_state_t *out);

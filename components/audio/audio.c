@@ -34,6 +34,8 @@ static SemaphoreHandle_t s_lock;
 static audio_status_t s_status;
 static uint32_t s_alarm_offset;
 static volatile bool s_stop_requested;
+static SemaphoreHandle_t s_stream_lock;
+static i2s_chan_handle_t s_stream_tx;
 
 static const int8_t IMA_INDEX_TABLE[16] = {
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -449,11 +451,87 @@ esp_err_t audio_stop_and_save_offset(void)
     return xQueueSend(s_queue, &cmd, 0) == pdTRUE ? ESP_OK : ESP_OK;
 }
 
+esp_err_t audio_stream_start(uint32_t sample_rate_hz)
+{
+    ESP_RETURN_ON_FALSE(s_lock && s_stream_lock, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
+    if (sample_rate_hz == 0) {
+        sample_rate_hz = MAMBA_AUDIO_SAMPLE_RATE_HZ;
+    }
+    s_stop_requested = true;
+    if (xSemaphoreTake(s_stream_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_stream_tx) {
+        i2s_channel_disable(s_stream_tx);
+        i2s_del_channel(s_stream_tx);
+        s_stream_tx = NULL;
+    }
+    esp_err_t err = create_i2s(sample_rate_hz, &s_stream_tx);
+    if (err == ESP_OK) {
+        set_status(true, "speaker_stream", 0, sample_rate_hz);
+    }
+    xSemaphoreGive(s_stream_lock);
+    return err;
+}
+
+esp_err_t audio_stream_write_pcm(const int16_t *samples, size_t sample_count)
+{
+    ESP_RETURN_ON_FALSE(samples && sample_count > 0, ESP_ERR_INVALID_ARG, TAG, "bad pcm");
+    ESP_RETURN_ON_FALSE(s_stream_lock, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
+    if (xSemaphoreTake(s_stream_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_stream_tx) {
+        xSemaphoreGive(s_stream_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    enum { STREAM_FRAMES = 128 };
+    int16_t stereo[STREAM_FRAMES * 2];
+    size_t pos = 0;
+    esp_err_t ret = ESP_OK;
+    while (pos < sample_count) {
+        size_t frames = sample_count - pos;
+        if (frames > STREAM_FRAMES) {
+            frames = STREAM_FRAMES;
+        }
+        mono_to_stereo(samples + pos, stereo, frames);
+        size_t requested = frames * 2 * sizeof(stereo[0]);
+        size_t written = 0;
+        ret = i2s_channel_write(s_stream_tx, stereo, requested, &written, 1000);
+        note_i2s_write(requested, written, ret);
+        if (ret != ESP_OK || written != requested) {
+            break;
+        }
+        pos += frames;
+    }
+    xSemaphoreGive(s_stream_lock);
+    return ret;
+}
+
+esp_err_t audio_stream_stop(void)
+{
+    if (!s_stream_lock) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_stream_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_stream_tx) {
+        i2s_channel_disable(s_stream_tx);
+        i2s_del_channel(s_stream_tx);
+        s_stream_tx = NULL;
+    }
+    set_status(false, "speaker_stream", 0, MAMBA_AUDIO_SAMPLE_RATE_HZ);
+    xSemaphoreGive(s_stream_lock);
+    return ESP_OK;
+}
+
 esp_err_t audio_init(void)
 {
     s_queue = xQueueCreate(4, sizeof(audio_cmd_t));
     s_lock = xSemaphoreCreateMutex();
-    ESP_RETURN_ON_FALSE(s_queue && s_lock, ESP_ERR_NO_MEM, TAG, "audio alloc");
+    s_stream_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_queue && s_lock && s_stream_lock, ESP_ERR_NO_MEM, TAG, "audio alloc");
     BaseType_t ok = xTaskCreate(audio_task, "audio_task", 6144, NULL, 4, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "audio task");
     ESP_LOGI(TAG, "audio ready, wav self-test=%s", audio_self_test() ? "ok" : "fail");

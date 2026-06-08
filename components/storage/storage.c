@@ -39,6 +39,7 @@ esp_err_t storage_load_config(mamba_config_t *config)
     load_string(nvs, "pass", config->ap_password, sizeof(config->ap_password));
     load_string(nvs, "alarm_file", config->alarm_file, sizeof(config->alarm_file));
     load_string(nvs, "power_file", config->power_on_file, sizeof(config->power_on_file));
+    load_string(nvs, "can_filter", config->can_filter, sizeof(config->can_filter));
     load_string(nvs, "wifi_ssid", config->wifi_ssid, sizeof(config->wifi_ssid));
     load_string(nvs, "wifi_pass", config->wifi_password, sizeof(config->wifi_password));
     nvs_get_u32(nvs, "can_bitrate", &config->can_bitrate);
@@ -62,6 +63,12 @@ esp_err_t storage_load_config(mamba_config_t *config)
     if (nvs_get_u8(nvs, "alarm_en", &value) == ESP_OK) {
         config->alarm_enabled = value != 0;
     }
+    if (nvs_get_u8(nvs, "can_raw_en", &value) == ESP_OK) {
+        config->can_raw_enabled = value != 0;
+    }
+    if (nvs_get_u8(nvs, "dji_parse", &value) == ESP_OK) {
+        config->dji_motor_parse_enabled = value != 0;
+    }
     if (nvs_get_u8(nvs, "cap_enter", &value) == ESP_OK) {
         config->low_capacity_enter_pct = value;
     }
@@ -83,6 +90,7 @@ esp_err_t storage_save_config(const mamba_config_t *config)
     nvs_set_str(nvs, "pass", config->ap_password);
     nvs_set_str(nvs, "alarm_file", config->alarm_file);
     nvs_set_str(nvs, "power_file", config->power_on_file);
+    nvs_set_str(nvs, "can_filter", config->can_filter);
     nvs_set_str(nvs, "wifi_ssid", config->wifi_ssid);
     nvs_set_str(nvs, "wifi_pass", config->wifi_password);
     nvs_set_u32(nvs, "can_bitrate", config->can_bitrate);
@@ -94,6 +102,8 @@ esp_err_t storage_save_config(const mamba_config_t *config)
     nvs_set_u16(nvs, "udp_tel", config->udp_telemetry_port);
     nvs_set_u8(nvs, "tel_en", config->telemetry_enabled ? 1 : 0);
     nvs_set_u8(nvs, "alarm_en", config->alarm_enabled ? 1 : 0);
+    nvs_set_u8(nvs, "can_raw_en", config->can_raw_enabled ? 1 : 0);
+    nvs_set_u8(nvs, "dji_parse", config->dji_motor_parse_enabled ? 1 : 0);
     nvs_set_u8(nvs, "cap_enter", config->low_capacity_enter_pct);
     nvs_set_u8(nvs, "cap_exit", config->low_capacity_exit_pct);
     nvs_set_blob(nvs, "adc_factor", &config->adc_calibration_factor, sizeof(config->adc_calibration_factor));

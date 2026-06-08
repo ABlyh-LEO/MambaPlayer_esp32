@@ -15,6 +15,8 @@ class PropertyPanel(QtWidgets.QWidget):
     serial_connect_requested = QtCore.Signal(str)
     audio_upload_requested = QtCore.Signal(str, str)
     audio_test_requested = QtCore.Signal(str)
+    can_config_requested = QtCore.Signal(str, bool, bool)
+    speaker_toggled = QtCore.Signal(bool)
 
     def __init__(self, store: TelemetryStore, wave: WavePanel) -> None:
         super().__init__()
@@ -85,10 +87,35 @@ class PropertyPanel(QtWidgets.QWidget):
         test_row.addWidget(self.long_tone_test_button)
         test_row.addWidget(self.audio_stop_button)
         self.audio_status = QtWidgets.QLabel("16 kHz mono IMA ADPCM on device")
+        self.speaker_button = QtWidgets.QPushButton("Start Speaker Mode")
+        self.speaker_button.setCheckable(True)
+        self.speaker_button.toggled.connect(self._speaker_changed)
         audio.addLayout(upload_row)
         audio.addLayout(test_row)
+        audio.addWidget(self.speaker_button)
         audio.addWidget(self.audio_status)
         layout.addWidget(self.audio)
+
+        self.can = QtWidgets.QGroupBox("CAN")
+        can_layout = QtWidgets.QFormLayout(self.can)
+        self.can_filter = QtWidgets.QLineEdit("0x201-0x208,0x200,0x1FF")
+        self.can_raw = QtWidgets.QCheckBox("Raw")
+        self.can_raw.setChecked(True)
+        self.can_dji = QtWidgets.QCheckBox("DJI Parse")
+        self.can_dji.setChecked(True)
+        self.can_config_button = QtWidgets.QPushButton("Apply CAN")
+        self.can_config_button.clicked.connect(
+            lambda: self.can_config_requested.emit(
+                self.can_filter.text(),
+                self.can_raw.isChecked(),
+                self.can_dji.isChecked(),
+            )
+        )
+        can_layout.addRow("Filter", self.can_filter)
+        can_layout.addRow("", self.can_raw)
+        can_layout.addRow("", self.can_dji)
+        can_layout.addRow("", self.can_config_button)
+        layout.addWidget(self.can)
 
         self.measure_box = QtWidgets.QGroupBox("Cursor Measurement")
         measure_layout = QtWidgets.QVBoxLayout(self.measure_box)
@@ -155,6 +182,10 @@ class PropertyPanel(QtWidgets.QWidget):
     def _mock_changed(self, checked: bool) -> None:
         self.mock_button.setText("Stop Mock" if checked else "Start Mock")
         self.mock_toggled.emit(checked)
+
+    def _speaker_changed(self, checked: bool) -> None:
+        self.speaker_button.setText("Stop Speaker Mode" if checked else "Start Speaker Mode")
+        self.speaker_toggled.emit(checked)
 
     def _pick_audio(self, kind: str) -> None:
         title = "Upload Alarm Audio" if kind == "alarm" else "Upload Power-On Audio"

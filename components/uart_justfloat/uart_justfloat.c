@@ -5,10 +5,11 @@
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "link.h"
 #include "mamba_config.h"
+#include "telemetry_mux.h"
 
 #define JUSTFLOAT_MAX_FRAME 128
 #define JUSTFLOAT_MAX_VALUES 16
@@ -40,7 +41,13 @@ static void process_frame(const uint8_t *buf, size_t len)
     }
     float values[JUSTFLOAT_MAX_VALUES];
     memcpy(values, buf, data_len);
-    link_publish_justfloat(values, count, s_dropped);
+    telemetry_justfloat_frame_t frame = {
+        .count = count,
+        .dropped_count = s_dropped,
+        .timestamp_us = (uint64_t)esp_timer_get_time(),
+    };
+    memcpy(frame.values, values, data_len);
+    telemetry_mux_publish_justfloat(&frame);
 }
 
 static void uart_task(void *arg)

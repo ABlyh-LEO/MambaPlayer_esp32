@@ -19,6 +19,9 @@ TYPE_ACK = 8
 TYPE_AUDIO_TEST = 9
 TYPE_ERROR = 10
 TYPE_WIFI_CONFIG = 11
+TYPE_AUDIO_STREAM_START = 12
+TYPE_AUDIO_STREAM_PCM = 13
+TYPE_AUDIO_STREAM_STOP = 14
 TYPE_TELEMETRY = 64
 
 STREAM_BATTERY = 1
@@ -26,6 +29,7 @@ STREAM_CAN_RAW = 2
 STREAM_RM_MOTOR = 3
 STREAM_JUSTFLOAT = 4
 STREAM_ALARM = 5
+STREAM_ADC_BATCH = 6
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -112,6 +116,18 @@ def decode_udp_packet(packet: bytes) -> dict:
 
 
 def parse_can_payload(payload: bytes) -> dict:
+    if len(payload) >= 4:
+        count = struct.unpack_from("<H", payload, 0)[0]
+        if count > 0 and len(payload) >= 4 + count * 24:
+            frames = []
+            for i in range(count):
+                off = 4 + i * 24
+                can_id = struct.unpack_from("<I", payload, off)[0]
+                dlc = payload[off + 4]
+                timestamp_us = struct.unpack_from("<Q", payload, off + 8)[0]
+                data = payload[off + 16:off + 16 + min(dlc, 8)]
+                frames.append({"id": can_id, "dlc": dlc, "timestamp_us": timestamp_us, "data": data})
+            return {"frames": frames, "dropped": struct.unpack_from("<H", payload, 2)[0]}
     if len(payload) < 24:
         raise ValueError("CAN payload too short")
     can_id = struct.unpack_from("<I", payload, 0)[0]
@@ -122,11 +138,74 @@ def parse_can_payload(payload: bytes) -> dict:
 
 
 def parse_justfloat_payload(payload: bytes) -> dict:
-    if len(payload) < 8:
-        raise ValueError("JustFloat payload too short")
-    count = payload[0]
-    dropped = struct.unpack_from("<I", payload, 4)[0]
-    if count > 16 or len(payload) < 8 + count * 4:
-        raise ValueError("bad JustFloat count")
-    values = struct.unpack_from("<" + "f" * count, payload, 8)
-    return {"count": count, "dropped": dropped, "values": values}
+    if len(payload) >= 8:
+        count = payload[0]
+        if 0 < count <= 16 and len(payload) == 8 + count * 4:
+            dropped = struct.unpack_from("<I", payload, 4)[0]
+            values = struct.unpack_from("<" + "f" * count, payload, 8)
+            return {"count": count, "dropped": dropped, "values": values}
+    if len(payload) >= 4:
+        frames = struct.unpack_from("<H", payload, 0)[0]
+        if frames > 0:
+            off = 4
+            out = []
+            for _ in range(frames):
+                if len(payload) < off + 12:
+                    raise ValueError("bad JustFloat batch")
+                timestamp_us = struct.unpack_from("<Q", payload, off)[0]
+                count = payload[off + 8]
+                off += 12
+                if count > 16 or len(payload) < off + count * 4:
+                    raise ValueError("bad JustFloat count")
+                values = struct.unpack_from("<" + "f" * count, payload, off)
+                off += count * 4
+                out.append({"timestamp_us": timestamp_us, "values": values})
+            return {"frames": out, "dropped": struct.unpack_from("<H", payload, 2)[0]}
+    raise ValueError("bad JustFloat payload")
+
+
+def parse_adc_batch_payload(payload: bytes) -> dict:
+    if len(payload) < 12:
+        raise ValueError("ADC payload too short")
+    sample_start, interval_us, count, dropped = struct.unpack_from("<IIHH", payload, 0)
+    if len(payload) < 12 + count * 8:
+        raise ValueError("bad ADC sample count")
+    samples = []
+    for i in range(count):
+        off = 12 + i * 8
+        battery_mv, pin_mv, raw = struct.unpack_from("<IHH", payload, off)
+        samples.append({
+            "sample": sample_start + i,
+            "time_offset_us": interval_us * i,
+            "battery_mv": battery_mv,
+            "pin_mv": pin_mv,
+            "raw": raw,
+        })
+    return {"sample_start": sample_start, "interval_us": interval_us, "dropped": dropped, "samples": samples}
+
+
+def parse_rm_motor_payload(payload: bytes) -> dict:
+    if len(payload) < 4:
+        raise ValueError("RM motor payload too short")
+    count, dropped = struct.unpack_from("<HH", payload, 0)
+    if len(payload) < 4 + count * 24:
+        raise ValueError("bad RM motor count")
+    motors = []
+    for i in range(count):
+        off = 4 + i * 24
+        timestamp_us = struct.unpack_from("<Q", payload, off)[0]
+        motor_id = payload[off + 8]
+        temperature = payload[off + 9]
+        error = payload[off + 10]
+        angle, rpm, torque_current, commanded_current = struct.unpack_from("<Hhhh", payload, off + 12)
+        motors.append({
+            "timestamp_us": timestamp_us,
+            "motor_id": motor_id,
+            "angle": angle,
+            "rpm": rpm,
+            "torque_current": torque_current,
+            "commanded_current": commanded_current,
+            "temperature": temperature,
+            "error": error,
+        })
+    return {"motors": motors, "dropped": dropped}

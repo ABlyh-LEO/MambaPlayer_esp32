@@ -72,6 +72,9 @@ typedef struct {
     bool alarm_enabled;
     char alarm_file[64];
     char power_on_file[64];
+    bool can_raw_enabled;
+    bool dji_motor_parse_enabled;
+    char can_filter[96];
     char wifi_ssid[33];
     char wifi_password[65];
     uint16_t tcp_port;
