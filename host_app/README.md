@@ -59,9 +59,15 @@ USB once, then network-only control and audio upload can work after reconnect.
 - Power-on audio is limited to 10 seconds. Alarm audio uses the remaining
   storage budget reported by firmware status; without a status packet the app
   assumes the current `0x250000` SPIFFS partition.
-- Speaker Mode captures the default Windows output device through WASAPI
-  loopback when available and streams `16 kHz` mono PCM to the firmware. It does
-  not install a virtual sound card driver.
+- Speaker Mode streams `16 kHz` mono PCM to the firmware. On Windows it prefers
+  VB-CABLE: set Windows or the target player output device to `CABLE Input
+  (VB-Audio Virtual Cable)`, then the app captures `CABLE Output (VB-Audio
+  Virtual Cable)`. This makes Mamba behave like the selected playback device
+  instead of depending on the physical PC speakers. If VB-CABLE is unavailable,
+  the app falls back to loopback-like capture inputs such as Stereo Mix.
+- VB-CABLE provides the virtual audio device; the app only captures it and
+  forwards PCM to the ESP32. It does not install a driver or create a Windows
+  audio endpoint by itself.
 
 ## Diagnostics
 

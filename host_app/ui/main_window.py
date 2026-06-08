@@ -217,7 +217,7 @@ class SpeakerCapture(QtCore.QThread):
         try:
             self._run_wasapi()
         except Exception as exc:
-            self.failed.emit(f"WASAPI loopback failed: {exc}")
+            self.failed.emit(f"speaker capture failed: {exc}")
 
     def _run_wasapi(self) -> None:
         import sounddevice as sd
@@ -246,26 +246,43 @@ class SpeakerCapture(QtCore.QThread):
 
     def _select_loopback_input(self, sd):
         devices = sd.query_devices()
-        preferred_terms = (
-            "loopback",
-            "stereo mix",
-            "立体声混音",
-            "what u hear",
-            "output with hap",
-        )
-        usable = []
+        hostapis = sd.query_hostapis()
+        candidates = []
         for index, device in enumerate(devices):
             if int(device.get("max_input_channels") or 0) <= 0:
                 continue
             name = str(device.get("name", ""))
+            hostapi = hostapis[int(device.get("hostapi", 0))]["name"]
             lower = name.lower()
-            if any(term in lower or term in name for term in preferred_terms):
-                usable.append((index, device))
-        if usable:
-            return usable[0]
+            score = 0
+            # VB-CABLE playback goes to "CABLE Input"; the host captures "CABLE Output".
+            if "cable output" in lower and "vb-audio" in lower:
+                score += 1000
+            elif "vb-audio" in lower and ("output" in lower or "input" in lower):
+                score += 700
+            elif "loopback" in lower:
+                score += 500
+            elif "stereo mix" in lower or "立体声混音" in name:
+                score += 300
+            elif "what u hear" in lower:
+                score += 250
+            elif "output with hap" in lower:
+                score += 100
+            if score == 0:
+                continue
+            if hostapi == "Windows WASAPI":
+                score += 50
+            elif hostapi == "Windows DirectSound":
+                score += 20
+            elif hostapi == "MME":
+                score += 10
+            candidates.append((score, index, device))
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            return candidates[0][1], candidates[0][2]
         raise RuntimeError(
-            "no system-audio capture device found. Enable Windows Stereo Mix, "
-            "install a loopback-capable audio backend, or select a device exposed as loopback."
+            "no system-audio capture device found. Install VB-CABLE and route audio to "
+            "CABLE Input, or enable Windows Stereo Mix."
         )
 
     def _to_pcm16(self, mono: np.ndarray, source_rate: int) -> np.ndarray:
@@ -584,7 +601,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self.speaker_worker = SpeakerCapture()
             self.speaker_worker.pcm_ready.connect(self._send_speaker_pcm, QtCore.Qt.DirectConnection)
-            self.speaker_worker.state.connect(self._log)
+            self.speaker_worker.state.connect(self._speaker_state)
             self.speaker_worker.failed.connect(self._speaker_failed)
             self.speaker_worker.start()
             self._log("speaker mode started")
@@ -599,6 +616,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as exc:
                     self._log(f"speaker stop failed: {exc}")
             self._log("speaker mode stopped")
+
+    def _speaker_state(self, message: str) -> None:
+        self.properties.audio_status.setText(message)
+        self._log(message)
 
     def _speaker_failed(self, message: str) -> None:
         self._log(message)

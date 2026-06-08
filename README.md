@@ -57,6 +57,9 @@ host_app\.venv\Scripts\python.exe host_app\app.py
 
 The host app provides a VOFA+-style dark dock workspace, channel store, CAN raw
 table, status view, audio upload controls, Wi-Fi provisioning and speaker mode.
+With VB-CABLE installed, Speaker Mode prefers `CABLE Output` capture while
+Windows or an individual player outputs to `CABLE Input`, so the device behaves
+like a virtual speaker target without relying on the PC's physical speakers.
 See [host_app/README.md](host_app/README.md) for details and probe commands.
 
 ## Verification
