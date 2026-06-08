@@ -455,6 +455,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.properties.audio_upload_requested.connect(self._upload_audio)
         self.properties.audio_test_requested.connect(self._test_audio)
         self.properties.can_config_requested.connect(self._send_can_config)
+        self.properties.device_name_requested.connect(self._send_device_name)
         self.properties.speaker_toggled.connect(self._toggle_speaker)
         self.properties.mock_toggled.connect(self._toggle_mock)
         self.properties.serial_connect_requested.connect(self._connect_serial)
@@ -482,6 +483,14 @@ class MainWindow(QtWidgets.QMainWindow):
         }).encode()
         self._send(TYPE_SET_CONFIG, payload)
         self._log(f"CAN config sent: filter={can_filter!r}, raw={raw_enabled}, dji={dji_enabled}")
+
+    def _send_device_name(self, name: str) -> None:
+        name = name.strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Device Name", "Device name cannot be empty.")
+            return
+        self._send(TYPE_SET_CONFIG, json.dumps({"device_name": name}).encode())
+        self._log(f"device name sent: {name!r}")
 
     def _status_json(self) -> dict:
         try:

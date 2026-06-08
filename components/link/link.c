@@ -512,6 +512,10 @@ static void handle_set_config(const link_rx_frame_t *frame)
     body[frame->len] = 0;
     uint32_t u32;
     float f;
+    char text[sizeof(s_config.device_name)] = {0};
+    if (json_get_string(body, "device_name", text, sizeof(text)) && text[0] != '\0') {
+        strlcpy(s_config.device_name, text, sizeof(s_config.device_name));
+    }
     if (json_get_u32(body, "can_bitrate", &u32) && (u32 == 250000 || u32 == 500000 || u32 == 1000000)) {
         s_config.can_bitrate = u32;
     }

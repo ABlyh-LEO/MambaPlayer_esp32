@@ -11,6 +11,8 @@ audio, battery and CAN monitor.
   after DHCP, the firmware connects back to the gateway IP on TCP `37210`.
   If the host app is not running yet, the firmware keeps retrying the TCP
   connection while Wi-Fi stays connected.
+- The STA DHCP hostname defaults to `MambaPlayer-C3-XXXX`, so the computer
+  hotspot should no longer show the device as plain `espressif`.
 - TCP `37210` carries reliable MambaLink control, status, config, audio upload
   and speaker PCM streaming.
 - UDP `37211` carries hello/heartbeat packets.
@@ -20,6 +22,8 @@ audio, battery and CAN monitor.
   audio upload when Wi-Fi is not available.
 - UART0 is reserved for external VOFA+ JustFloat input at `1000000 8N1`; it is
   not used for ESP-IDF console logs.
+- CAN defaults to `1 Mbps`; the host can still configure `250 kbps`, `500 kbps`
+  or `1 Mbps`.
 
 ## Firmware
 

@@ -1,11 +1,13 @@
 #include "wifi_client.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -19,6 +21,7 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_NEEDS_RECONNECT_BIT BIT1
 #define TCP_RETRY_DELAY_MS 1000
+#define WIFI_HOSTNAME_MAX_LEN 32
 
 static const char *TAG = "wifi_client";
 static EventGroupHandle_t s_events;
@@ -26,6 +29,63 @@ static SemaphoreHandle_t s_lock;
 static esp_netif_t *s_sta_netif;
 static mamba_config_t s_config;
 static bool s_started;
+
+static bool hostname_char_ok(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '-';
+}
+
+static void make_hostname(char *out, size_t out_len)
+{
+    const char *name = s_config.device_name[0] ? s_config.device_name : MAMBA_DEFAULT_DEVICE_NAME;
+    uint8_t mac[6] = {0};
+    (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char suffix[8];
+    snprintf(suffix, sizeof(suffix), "-%02X%02X", mac[4], mac[5]);
+
+    size_t suffix_len = strlen(suffix);
+    size_t max_base = out_len > suffix_len + 1 ? out_len - suffix_len - 1 : 0;
+    size_t used = 0;
+    for (size_t i = 0; name[i] && used < max_base; ++i) {
+        char c = name[i];
+        if (c == ' ' || c == '_' || c == '.') {
+            c = '-';
+        }
+        if (!hostname_char_ok(c)) {
+            continue;
+        }
+        if (c == '-' && (used == 0 || out[used - 1] == '-')) {
+            continue;
+        }
+        out[used++] = c;
+    }
+    while (used > 0 && out[used - 1] == '-') {
+        used--;
+    }
+    if (used == 0) {
+        strlcpy(out, MAMBA_DEFAULT_DEVICE_NAME, out_len);
+        used = strlen(out);
+    } else {
+        out[used] = '\0';
+    }
+    strlcat(out, suffix, out_len);
+}
+
+static void apply_hostname_locked(void)
+{
+    if (!s_sta_netif) {
+        return;
+    }
+    char hostname[WIFI_HOSTNAME_MAX_LEN] = {0};
+    make_hostname(hostname, sizeof(hostname));
+    esp_err_t err = esp_netif_set_hostname(s_sta_netif, hostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set hostname failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "wifi hostname: %s", hostname);
+    }
+}
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -41,6 +101,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
 static void configure_sta_locked(void)
 {
     wifi_config_t wifi = {0};
+    apply_hostname_locked();
     strlcpy((char *)wifi.sta.ssid, s_config.wifi_ssid, sizeof(wifi.sta.ssid));
     strlcpy((char *)wifi.sta.password, s_config.wifi_password, sizeof(wifi.sta.password));
     wifi.sta.threshold.authmode = strlen(s_config.wifi_password) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;

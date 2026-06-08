@@ -16,6 +16,7 @@ class PropertyPanel(QtWidgets.QWidget):
     audio_upload_requested = QtCore.Signal(str, str)
     audio_test_requested = QtCore.Signal(str)
     can_config_requested = QtCore.Signal(str, bool, bool)
+    device_name_requested = QtCore.Signal(str)
     speaker_toggled = QtCore.Signal(bool)
 
     def __init__(self, store: TelemetryStore, wave: WavePanel) -> None:
@@ -41,12 +42,17 @@ class PropertyPanel(QtWidgets.QWidget):
         self.serial_button.clicked.connect(lambda: self.serial_connect_requested.emit(self.serial_combo.currentData() or ""))
         self.status_button = QtWidgets.QPushButton("Request Status")
         self.status_button.clicked.connect(self.status_requested.emit)
+        self.device_name = QtWidgets.QLineEdit("MambaPlayer-C3")
+        self.device_name_button = QtWidgets.QPushButton("Apply Name")
+        self.device_name_button.clicked.connect(lambda: self.device_name_requested.emit(self.device_name.text()))
         conn.addRow("TCP", self.tcp_label)
         conn.addRow("UDP Hello", self.udp_label)
         conn.addRow("USB", self.usb_label)
         conn.addRow("Port", self.serial_combo)
         conn.addRow("", self.serial_button)
         conn.addRow("", self.status_button)
+        conn.addRow("Device", self.device_name)
+        conn.addRow("", self.device_name_button)
         layout.addWidget(self.connection)
 
         self.wifi = QtWidgets.QGroupBox("Wi-Fi Provisioning")
@@ -156,6 +162,9 @@ class PropertyPanel(QtWidgets.QWidget):
                 status = json.loads(self.store.state.last_status)
                 audio = status.get("audio", {})
                 storage = status.get("storage", {})
+                device = status.get("device", "")
+                if device and not self.device_name.hasFocus():
+                    self.device_name.setText(str(device))
                 used = int(storage.get("used", 0))
                 total = int(storage.get("total", 0))
                 current = audio.get("current", "")

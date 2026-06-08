@@ -5,7 +5,7 @@
 void mamba_config_defaults(mamba_config_t *config)
 {
     memset(config, 0, sizeof(*config));
-    strlcpy(config->device_name, "Mamba C3", sizeof(config->device_name));
+    strlcpy(config->device_name, MAMBA_DEFAULT_DEVICE_NAME, sizeof(config->device_name));
     config->can_bitrate = 1000000;
     config->telemetry_enabled = true;
     config->telemetry_interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;

@@ -40,6 +40,9 @@ esp_err_t storage_load_config(mamba_config_t *config)
     load_string(nvs, "can_filter", config->can_filter, sizeof(config->can_filter));
     load_string(nvs, "wifi_ssid", config->wifi_ssid, sizeof(config->wifi_ssid));
     load_string(nvs, "wifi_pass", config->wifi_password, sizeof(config->wifi_password));
+    if (strcmp(config->device_name, "Mamba C3") == 0) {
+        strlcpy(config->device_name, MAMBA_DEFAULT_DEVICE_NAME, sizeof(config->device_name));
+    }
     nvs_get_u32(nvs, "can_bitrate", &config->can_bitrate);
     nvs_get_u32(nvs, "tel_ms", &config->telemetry_interval_ms);
     nvs_get_u32(nvs, "v_enter", &config->low_voltage_enter_mv);
