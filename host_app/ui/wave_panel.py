@@ -26,9 +26,15 @@ class WavePanel(QtWidgets.QWidget):
         self.cursor_b = None
         self.curves: dict[str, object] = {}
         self.window_seconds = 10.0
+        self._dirty = False
+        self._last_snapshot_emit = 0
         self._build_ui()
-        self.store.changed.connect(self.refresh)
+        self.store.changed.connect(self.mark_dirty)
         self.store.channels_changed.connect(self.rebuild_curves)
+        self.refresh_timer = QtCore.QTimer(self)
+        self.refresh_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.refresh_timer.timeout.connect(self.refresh)
+        self.refresh_timer.start(16)
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -49,7 +55,7 @@ class WavePanel(QtWidgets.QWidget):
         self.follow_action.setChecked(True)
         self.follow_action.toggled.connect(lambda value: setattr(self, "follow_tail", value))
         self.toolbar.addSeparator()
-        self.toolbar.addWidget(QtWidgets.QLabel("Δt"))
+        self.toolbar.addWidget(QtWidgets.QLabel("dt"))
         self.window_spin = QtWidgets.QDoubleSpinBox()
         self.window_spin.setRange(0.1, 3600)
         self.window_spin.setValue(self.window_seconds)
@@ -72,7 +78,7 @@ class WavePanel(QtWidgets.QWidget):
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#070b10")
         self.plot.showGrid(x=True, y=True, alpha=0.18)
-        self.plot.setLabel("bottom", "Δt", units="s")
+        self.plot.setLabel("bottom", "dt", units="s")
         self.plot.setLabel("left", "Value")
         self.plot.addLegend(offset=(10, 10))
         self.plot.setMenuEnabled(True)
@@ -107,11 +113,15 @@ class WavePanel(QtWidgets.QWidget):
             else:
                 self.curves[key].setPen(pg.mkPen(channel.color, width=1.4))
                 self.curves[key].opts["name"] = channel.name
+        self._dirty = True
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
 
     def refresh(self) -> None:
-        if not self.running or pg is None:
+        if not self.running or pg is None or not self._dirty:
             return
-        self.rebuild_curves()
+        self._dirty = False
         latest = None
         for key, channel in self.store.channels.items():
             curve = self.curves.get(key)
@@ -120,7 +130,7 @@ class WavePanel(QtWidgets.QWidget):
             if not channel.enabled:
                 curve.setData([], [])
                 continue
-            t, v = channel.arrays()
+            t, v = channel.tail_arrays(self.window_seconds if self.follow_tail else None)
             if t.size:
                 latest = max(float(t[-1]), latest or float(t[-1]))
                 curve.setData(t, v)
@@ -128,7 +138,10 @@ class WavePanel(QtWidgets.QWidget):
                 curve.setData([], [])
         if self.follow_tail and latest is not None:
             self.plot.setXRange(max(0.0, latest - self.window_seconds), latest, padding=0)
-        self.snapshot_requested.emit()
+        now = QtCore.QDateTime.currentMSecsSinceEpoch()
+        if now - self._last_snapshot_emit >= 1000:
+            self._last_snapshot_emit = now
+            self.snapshot_requested.emit()
 
     def auto_y(self) -> None:
         if pg is None:

@@ -34,6 +34,14 @@ class TelemetryStoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(values[-1]), 6.0)
         self.assertEqual(store.channels["adc"].snapshot()["scale"], 2.0)
 
+    def test_tail_arrays_returns_visible_window_after_wrap(self):
+        store = TelemetryStore(capacity=5)
+        for i in range(8):
+            store.append_sample("adc", "ADC", float(i), timestamp_s=float(i))
+        times, values = store.channels["adc"].tail_arrays(2.5)
+        np.testing.assert_array_equal(times, np.array([5.0, 6.0, 7.0]))
+        np.testing.assert_array_equal(values, np.array([5.0, 6.0, 7.0], dtype=np.float32))
+
     def test_channel_enable_and_udp_drop_count(self):
         store = TelemetryStore(capacity=8)
         store.append_sample("jf0", "JF0", 1.0, timestamp_s=1.0)

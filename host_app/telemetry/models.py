@@ -72,6 +72,33 @@ class Channel:
         v = np.concatenate((self._v[self._start:], self._v[:self._count - first]))
         return t, v
 
+    def tail_arrays(self, window_seconds: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+        if self._count == 0:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float32)
+        latest_idx = (self._start + self._count - 1) % self.capacity
+        latest = float(self._t[latest_idx])
+        if window_seconds is None or window_seconds <= 0:
+            return self.arrays()
+
+        cutoff = latest - window_seconds
+        if self._start + self._count <= self.capacity:
+            t_view = self._t[self._start:self._start + self._count]
+            v_view = self._v[self._start:self._start + self._count]
+            first = int(np.searchsorted(t_view, cutoff, side="left"))
+            return t_view[first:].copy(), v_view[first:].copy()
+
+        first_len = self.capacity - self._start
+        first_t = self._t[self._start:]
+        if first_t.size and cutoff <= float(first_t[-1]):
+            first_idx = int(np.searchsorted(first_t, cutoff, side="left"))
+            return (
+                np.concatenate((first_t[first_idx:], self._t[:self._count - first_len])),
+                np.concatenate((self._v[self._start + first_idx:], self._v[:self._count - first_len])),
+            )
+        second_t = self._t[:self._count - first_len]
+        first_idx = int(np.searchsorted(second_t, cutoff, side="left"))
+        return second_t[first_idx:].copy(), self._v[first_idx:self._count - first_len].copy()
+
     def visible_arrays(self, xmin: float | None = None, xmax: float | None = None) -> tuple[np.ndarray, np.ndarray]:
         t, v = self.arrays()
         if t.size == 0 or xmin is None or xmax is None:

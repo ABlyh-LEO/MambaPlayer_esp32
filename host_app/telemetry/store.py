@@ -30,6 +30,7 @@ class TelemetryStore(QtCore.QObject):
         self.state = AppState()
         self._last_seq: dict[int, int] = {}
         self._last_emit = 0.0
+        self._last_can_emit = 0.0
 
     def ensure_channel(self, key: str, name: str, unit: str = "", color: str | None = None) -> Channel:
         channel = self.channels.get(key)
@@ -89,7 +90,10 @@ class TelemetryStore(QtCore.QObject):
     def append_can(self, timestamp_us: int, can_id: int, dlc: int, data: bytes) -> None:
         self.can_rows.insert(0, CanRow(timestamp_us, can_id, dlc, " ".join(f"{b:02X}" for b in data)))
         del self.can_rows[500:]
-        self.can_changed.emit()
+        now = time.monotonic()
+        if now - self._last_can_emit >= 1 / 20:
+            self._last_can_emit = now
+            self.can_changed.emit()
 
     def update_state(self, **kwargs: str) -> None:
         for key, value in kwargs.items():

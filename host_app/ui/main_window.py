@@ -349,6 +349,37 @@ class SerialWorker(QtCore.QThread):
                 pass
 
 
+class AudioUploadWorker(QtCore.QThread):
+    progress = QtCore.Signal(str, int, int)
+    finished_ok = QtCore.Signal(str, int, float)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, transport, kind: str, path: str, max_seconds: float) -> None:
+        super().__init__()
+        self.transport = transport
+        self.kind = kind
+        self.path = path
+        self.max_seconds = max_seconds
+
+    def run(self) -> None:
+        try:
+            wav, info = convert_to_mamba_wav(self.path, max_seconds=self.max_seconds, return_info=True)
+            begin = json.dumps({"kind": self.kind, "size": len(wav)}).encode()
+            self.transport.send_wait(TYPE_AUDIO_BEGIN, begin, timeout=8.0)
+            sent = 0
+            while sent < len(wav):
+                chunk = wav[sent:sent + AUDIO_CHUNK_SIZE]
+                self.transport.send_wait(TYPE_AUDIO_CHUNK, chunk, timeout=12.0)
+                sent += len(chunk)
+                if sent == len(wav) or sent % (16 * 1024) < AUDIO_CHUNK_SIZE:
+                    self.progress.emit(self.kind, sent, len(wav))
+            self.transport.send_wait(TYPE_AUDIO_END, b"{}", timeout=8.0)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(self.kind, len(wav), float(info.get("gain_db", 0.0)))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, start_workers: bool = True) -> None:
         super().__init__()
@@ -365,6 +396,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.udp_tel = UdpListener(UDP_TELEMETRY_PORT)
         self.serial_worker: SerialWorker | None = None
         self.speaker_worker: SpeakerCapture | None = None
+        self.audio_upload_worker: AudioUploadWorker | None = None
         self._shutdown_done = False
         self.mock_timer = QtCore.QTimer(self)
         self.mock_timer.timeout.connect(self._mock_tick)
@@ -479,32 +511,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if not transport:
             QtWidgets.QMessageBox.warning(self, "Audio Upload", "Connect USB or TCP before uploading audio.")
             return
+        if self.audio_upload_worker and self.audio_upload_worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Audio Upload", "An audio upload is already running.")
+            return
         max_seconds = POWER_ON_MAX_SECONDS if kind == "poweron" else self._alarm_max_seconds()
-        try:
-            wav, info = convert_to_mamba_wav(path, max_seconds=max_seconds, return_info=True)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Audio Upload", str(exc))
-            self._log(f"audio upload rejected: {exc}")
-            return
+        self.audio_upload_worker = AudioUploadWorker(transport, kind, path, max_seconds)
+        self.audio_upload_worker.progress.connect(self._audio_upload_progress)
+        self.audio_upload_worker.finished_ok.connect(lambda upload_kind, size, gain_db: self._audio_upload_done(upload_kind, path, size, gain_db))
+        self.audio_upload_worker.failed.connect(self._audio_upload_failed)
+        self.audio_upload_worker.finished.connect(lambda: setattr(self, "audio_upload_worker", None))
+        self.properties.audio_status.setText(f"preparing {kind} upload...")
+        self._log(f"audio upload started: {kind} from {path}")
+        self.audio_upload_worker.start()
 
-        begin = json.dumps({"kind": kind, "size": len(wav)}).encode()
-        try:
-            transport.send_wait(TYPE_AUDIO_BEGIN, begin)
-            sent = 0
-            while sent < len(wav):
-                chunk = wav[sent:sent + AUDIO_CHUNK_SIZE]
-                transport.send_wait(TYPE_AUDIO_CHUNK, chunk, timeout=12.0)
-                sent += len(chunk)
-                if sent == len(wav) or sent % (32 * 1024) < AUDIO_CHUNK_SIZE:
-                    self.properties.audio_status.setText(f"uploading {kind}: {sent}/{len(wav)} bytes")
-                    QtWidgets.QApplication.processEvents()
-            transport.send_wait(TYPE_AUDIO_END, b"{}", timeout=6.0)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Audio Upload", str(exc))
-            self._log(f"audio upload failed: {exc}")
-            return
-        self._log(f"uploaded {kind} audio: {len(wav)} bytes from {path}, gain {info['gain_db']:.1f} dB")
+    def _audio_upload_progress(self, kind: str, sent: int, total: int) -> None:
+        percent = 100.0 * sent / max(1, total)
+        self.properties.audio_status.setText(f"uploading {kind}: {sent}/{total} bytes ({percent:.0f}%)")
+
+    def _audio_upload_done(self, kind: str, path: str, size: int, gain_db: float) -> None:
+        self.properties.audio_status.setText(f"uploaded {kind}: {size} bytes")
+        self._log(f"uploaded {kind} audio: {size} bytes from {path}, gain {gain_db:.1f} dB")
         self._send(TYPE_GET_STATUS, b"{}")
+
+    def _audio_upload_failed(self, message: str) -> None:
+        self.properties.audio_status.setText("audio upload failed")
+        self._log(f"audio upload failed: {message}")
+        QtWidgets.QMessageBox.warning(self, "Audio Upload", message)
 
     def _test_audio(self, command: str) -> None:
         self._send_control_only(TYPE_AUDIO_TEST, json.dumps({"cmd": command}).encode())
@@ -766,6 +798,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.speaker_worker:
             self._stop_worker(self.speaker_worker)
             self.speaker_worker = None
+        if self.audio_upload_worker:
+            self._stop_worker(self.audio_upload_worker)
+            self.audio_upload_worker = None
         for worker in (self.serial_worker, self.tcp, self.udp_hello, self.udp_tel):
             self._stop_worker(worker)
 
