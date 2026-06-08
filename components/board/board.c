@@ -1,26 +1,14 @@
 #include "mamba_config.h"
 
-#include <stdio.h>
 #include <string.h>
-
-#include "esp_mac.h"
-
-void mamba_make_default_ssid(char *ssid, size_t ssid_len)
-{
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    snprintf(ssid, ssid_len, "Mamba-C3-%02X%02X", mac[4], mac[5]);
-}
 
 void mamba_config_defaults(mamba_config_t *config)
 {
     memset(config, 0, sizeof(*config));
     strlcpy(config->device_name, "Mamba C3", sizeof(config->device_name));
-    mamba_make_default_ssid(config->ap_ssid, sizeof(config->ap_ssid));
-    config->ap_password[0] = '\0';
     config->can_bitrate = 1000000;
     config->telemetry_enabled = true;
-    config->telemetry_interval_ms = 100;
+    config->telemetry_interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
     config->adc_calibration_factor = 1.0f;
     config->low_voltage_enter_mv = 21000;
     config->low_voltage_exit_mv = 22000;

@@ -19,7 +19,13 @@ The app listens on:
 - UDP `37211` for device hello packets.
 - UDP `37212` for best-effort realtime telemetry.
 
-USB Serial/JTAG uses the same MambaLink frame format as TCP.
+USB Serial/JTAG uses the same MambaLink frame format as TCP. The GUI sends
+control and audio upload over USB when a device is connected; if USB is not
+connected, it uses the active TCP device connection.
+
+The firmware uses Wi-Fi STA mode and connects back to this app at the DHCP
+gateway IP. Configure hotspot credentials from the Wi-Fi provisioning panel over
+USB once, then network-only control and audio upload can work after reconnect.
 
 ## Wave Workspace
 
@@ -33,12 +39,37 @@ USB Serial/JTAG uses the same MambaLink frame format as TCP.
 - Mock mode generates battery, JustFloat and RoboMaster-like channels for
   no-hardware UI checks.
 
+## Telemetry
+
+- ADC samples are batched by the firmware at the configured telemetry interval,
+  defaulting to `4 ms` for a 500 Hz ADC source.
+- UART0 JustFloat is parsed as up to 16 little-endian float32 values followed by
+  the VOFA+ tail `00 00 80 7F`, then forwarded in realtime batches.
+- CAN raw and RoboMaster/DJI motor summaries are separate streams. The CAN panel
+  can configure raw forwarding, the ID filter expression, and DJI parsing.
+- UDP streams are best-effort. Sequence gaps are counted and displayed instead
+  of retransmitted.
+
+## Audio
+
+- Upload accepts common desktop audio inputs such as WAV, MP3, FLAC, OGG, AIFF
+  and M4A when the installed `soundfile` backend can decode them.
+- The host converts uploads to `16 kHz` mono IMA ADPCM WAV and applies peak
+  normalization before transfer.
+- Power-on audio is limited to 10 seconds. Alarm audio uses the remaining
+  storage budget reported by firmware status; without a status packet the app
+  assumes the current `0x250000` SPIFFS partition.
+- Speaker Mode captures the default Windows output device through WASAPI
+  loopback when available and streams `16 kHz` mono PCM to the firmware. It does
+  not install a virtual sound card driver.
+
 ## Diagnostics
 
 ```powershell
 host_app\.venv\Scripts\python.exe -m host_app.probe tcp-status --host 127.0.0.1
 host_app\.venv\Scripts\python.exe -m host_app.probe udp-once --port 37212
 host_app\.venv\Scripts\python.exe -m host_app.probe usb-wifi --port COM8 --ssid MyHotspot --password password
+host_app\.venv\Scripts\python.exe -m host_app.probe usb-upload-audio --port COM8 --kind alarm --file .\alarm.mp3
 host_app\.venv\Scripts\python.exe -m host_app.probe snapshot
 ```
 

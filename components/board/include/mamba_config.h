@@ -40,9 +40,11 @@ extern "C" {
 #define MAMBA_LINK_UDP_TELEMETRY_PORT 37212
 
 #define MAMBA_SPIFFS_BASE_PATH "/spiffs"
+#define MAMBA_STORAGE_PARTITION_BYTES 0x250000
 #define MAMBA_ALARM_DIR "/spiffs"
 #define MAMBA_DEFAULT_ALARM_FILE "/spiffs/alarm.wav"
 #define MAMBA_DEFAULT_POWER_ON_FILE "/spiffs/poweron.wav"
+#define MAMBA_TELEMETRY_BATCH_INTERVAL_MS 4
 #define MAMBA_AUDIO_SAMPLE_RATE_HZ 16000
 #define MAMBA_AUDIO_CHANNELS 1
 #define MAMBA_AUDIO_PCM_BITS_PER_SAMPLE 16
@@ -59,8 +61,6 @@ extern "C" {
 
 typedef struct {
     char device_name[32];
-    char ap_ssid[33];
-    char ap_password[65];
     uint32_t can_bitrate;
     bool telemetry_enabled;
     uint32_t telemetry_interval_ms;
@@ -83,7 +83,6 @@ typedef struct {
 } mamba_config_t;
 
 void mamba_config_defaults(mamba_config_t *config);
-void mamba_make_default_ssid(char *ssid, size_t ssid_len);
 
 #ifdef __cplusplus
 }

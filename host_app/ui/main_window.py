@@ -45,7 +45,7 @@ from ..mamba_link import (
     parse_justfloat_payload,
     parse_rm_motor_payload,
 )
-from ..audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
+from ..audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, convert_to_mamba_wav
 from ..telemetry.store import TelemetryStore
 from .channel_panel import ChannelPanel
 from .property_panel import PropertyPanel
@@ -59,7 +59,7 @@ STATE_PATH = Path(__file__).resolve().parents[1] / "runtime" / "state.json"
 AUDIO_CHUNK_SIZE = 384
 AUDIO_HEADER_ALLOWANCE_BYTES = 4096
 AUDIO_STORAGE_SAFETY_BYTES = 32 * 1024
-DEFAULT_SPIFFS_TOTAL_BYTES = 2_218_000
+DEFAULT_SPIFFS_TOTAL_BYTES = STORAGE_PARTITION_BYTES
 
 
 class TcpServer(QtCore.QThread):

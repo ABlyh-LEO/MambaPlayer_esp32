@@ -27,7 +27,7 @@ try:
         decode_udp_packet,
         encode_frame,
     )
-    from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
+    from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, convert_to_mamba_wav
 except ImportError:
     from mamba_link import (
         TYPE_ACK,
@@ -43,13 +43,13 @@ except ImportError:
         decode_udp_packet,
         encode_frame,
     )
-    from audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, convert_to_mamba_wav
+    from audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, convert_to_mamba_wav
 
 
 AUDIO_CHUNK_SIZE = 384
 AUDIO_HEADER_ALLOWANCE_BYTES = 4096
 AUDIO_STORAGE_SAFETY_BYTES = 32 * 1024
-DEFAULT_SPIFFS_TOTAL_BYTES = 2_218_000
+DEFAULT_SPIFFS_TOTAL_BYTES = STORAGE_PARTITION_BYTES
 
 
 def tcp_status(host: str, port: int, timeout: float) -> int:

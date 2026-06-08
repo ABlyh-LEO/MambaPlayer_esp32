@@ -174,9 +174,9 @@ class PropertyPanel(QtWidgets.QWidget):
         if not data:
             self.measure_text.setPlainText("Enable cursors and double-click the wave area twice.")
             return
-        lines = [f"Δt = {data['dt']:.6f} s"]
+        lines = [f"Delta t = {data['dt']:.6f} s"]
         for row in data["channels"]:
-            lines.append(f"{row['name']}: ΔY={row['dy']:.5g}  A={row['a']:.5g}  B={row['b']:.5g}")
+            lines.append(f"{row['name']}: Delta Y={row['dy']:.5g}  A={row['a']:.5g}  B={row['b']:.5g}")
         self.measure_text.setPlainText("\n".join(lines))
 
     def _mock_changed(self, checked: bool) -> None:
@@ -193,7 +193,7 @@ class PropertyPanel(QtWidgets.QWidget):
             self,
             title,
             "",
-            "Audio Files (*.wav *.flac *.ogg *.aiff *.aif);;All Files (*)",
+            "Audio Files (*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a);;All Files (*)",
         )
         if path:
             self.audio_upload_requested.emit(kind, path)

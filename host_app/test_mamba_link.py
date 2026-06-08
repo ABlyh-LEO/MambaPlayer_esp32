@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio_tools import TARGET_RATE, convert_to_mamba_wav, normalize_peak
+from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, TARGET_RATE, convert_to_mamba_wav, normalize_peak
 from .mamba_link import (
     STREAM_JUSTFLOAT,
     TYPE_HELLO,
@@ -93,6 +93,11 @@ class AudioTests(unittest.TestCase):
         normalized, gain = normalize_peak(samples)
         self.assertGreater(gain, 1.0)
         self.assertAlmostEqual(float(np.max(np.abs(normalized))), 0.98, places=5)
+
+    def test_alarm_budget_tracks_storage_partition(self):
+        power_on_budget = BYTES_PER_SECOND * POWER_ON_MAX_SECONDS + 4096
+        alarm_budget = STORAGE_PARTITION_BYTES - power_on_budget - 32 * 1024
+        self.assertGreater(alarm_budget / BYTES_PER_SECOND, 240.0)
 
 
 if __name__ == "__main__":

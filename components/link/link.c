@@ -223,7 +223,7 @@ static size_t alarm_max_file_bytes(void)
 {
     storage_info_t info = {0};
     if (storage_get_info(&info) != ESP_OK || info.total_bytes == 0) {
-        return 0x1D0000 - MAMBA_POWER_ON_MAX_FILE_BYTES - MAMBA_AUDIO_STORAGE_SAFETY_BYTES;
+        return MAMBA_STORAGE_PARTITION_BYTES - MAMBA_POWER_ON_MAX_FILE_BYTES - MAMBA_AUDIO_STORAGE_SAFETY_BYTES;
     }
     if (info.total_bytes <= MAMBA_POWER_ON_MAX_FILE_BYTES + MAMBA_AUDIO_STORAGE_SAFETY_BYTES) {
         return 0;
@@ -515,7 +515,7 @@ static void handle_set_config(const link_rx_frame_t *frame)
     if (json_get_u32(body, "can_bitrate", &u32) && (u32 == 250000 || u32 == 500000 || u32 == 1000000)) {
         s_config.can_bitrate = u32;
     }
-    if (json_get_u32(body, "telemetry_interval_ms", &u32) && u32 >= 20 && u32 <= 2000) {
+    if (json_get_u32(body, "telemetry_interval_ms", &u32) && u32 >= 2 && u32 <= 2000) {
         s_config.telemetry_interval_ms = u32;
     }
     bool b;
@@ -913,7 +913,11 @@ static void telemetry_task(void *arg)
         publish_rm_batch();
         publish_justfloat_batch();
         publish_low_rate_status(tick++);
-        vTaskDelay(pdMS_TO_TICKS(4));
+        uint32_t interval_ms = s_config.telemetry_interval_ms;
+        if (interval_ms < 2 || interval_ms > 2000) {
+            interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
     }
 }
 

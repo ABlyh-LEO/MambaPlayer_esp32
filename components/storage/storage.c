@@ -35,8 +35,6 @@ esp_err_t storage_load_config(mamba_config_t *config)
     ESP_RETURN_ON_ERROR(err, TAG, "open nvs");
 
     load_string(nvs, "device", config->device_name, sizeof(config->device_name));
-    load_string(nvs, "ssid", config->ap_ssid, sizeof(config->ap_ssid));
-    load_string(nvs, "pass", config->ap_password, sizeof(config->ap_password));
     load_string(nvs, "alarm_file", config->alarm_file, sizeof(config->alarm_file));
     load_string(nvs, "power_file", config->power_on_file, sizeof(config->power_on_file));
     load_string(nvs, "can_filter", config->can_filter, sizeof(config->can_filter));
@@ -86,8 +84,6 @@ esp_err_t storage_save_config(const mamba_config_t *config)
     nvs_handle_t nvs;
     ESP_RETURN_ON_ERROR(nvs_open(NVS_NS, NVS_READWRITE, &nvs), TAG, "open nvs");
     nvs_set_str(nvs, "device", config->device_name);
-    nvs_set_str(nvs, "ssid", config->ap_ssid);
-    nvs_set_str(nvs, "pass", config->ap_password);
     nvs_set_str(nvs, "alarm_file", config->alarm_file);
     nvs_set_str(nvs, "power_file", config->power_on_file);
     nvs_set_str(nvs, "can_filter", config->can_filter);
