@@ -40,6 +40,7 @@ esp_err_t link_init(const mamba_config_t *config);
 void link_set_config_updated_callback(mamba_link_config_updated_cb_t cb);
 void link_attach_tcp_socket(int sock, uint32_t host_ip_addr);
 void link_detach_tcp_socket(int sock);
+bool link_is_tcp_socket_attached(int sock);
 void link_set_udp_target(uint32_t host_ip_addr, uint16_t hello_port, uint16_t telemetry_port);
 bool link_self_test(void);
 

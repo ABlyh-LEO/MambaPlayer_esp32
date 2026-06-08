@@ -18,6 +18,7 @@
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_NEEDS_RECONNECT_BIT BIT1
+#define TCP_RETRY_DELAY_MS 1000
 
 static const char *TAG = "wifi_client";
 static EventGroupHandle_t s_events;
@@ -32,6 +33,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
         xEventGroupSetBits(s_events, WIFI_NEEDS_RECONNECT_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupClearBits(s_events, WIFI_NEEDS_RECONNECT_BIT);
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
     }
 }
@@ -52,23 +54,25 @@ static void tcp_client_task(void *arg)
 {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(s_events, WIFI_CONNECTED_BIT | WIFI_NEEDS_RECONNECT_BIT,
-                                               pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
-        if (bits & WIFI_NEEDS_RECONNECT_BIT) {
+                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+        if ((bits & WIFI_NEEDS_RECONNECT_BIT) && !(bits & WIFI_CONNECTED_BIT)) {
+            xEventGroupClearBits(s_events, WIFI_NEEDS_RECONNECT_BIT);
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
                 if (s_config.wifi_ssid[0]) {
                     esp_wifi_connect();
                 }
                 xSemaphoreGive(s_lock);
             }
+            vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
             continue;
         }
-        if (!(bits & WIFI_CONNECTED_BIT)) {
+        if ((xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT) == 0) {
             continue;
         }
 
         esp_netif_ip_info_t ip;
         if (!s_sta_netif || esp_netif_get_ip_info(s_sta_netif, &ip) != ESP_OK || ip.gw.addr == 0) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
             continue;
         }
         uint16_t tcp_port = s_config.tcp_port ? s_config.tcp_port : MAMBA_LINK_TCP_PORT;
@@ -78,7 +82,7 @@ static void tcp_client_task(void *arg)
 
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
             continue;
         }
         struct sockaddr_in dst = {
@@ -89,13 +93,15 @@ static void tcp_client_task(void *arg)
         if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
             ESP_LOGI(TAG, "connected to host " IPSTR ":%u", IP2STR(&ip.gw), tcp_port);
             link_attach_tcp_socket(sock, ip.gw.addr);
-            while ((xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT) != 0) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+            while ((xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT) != 0 &&
+                   link_is_tcp_socket_attached(sock)) {
+                vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
             }
             link_detach_tcp_socket(sock);
         } else {
             close(sock);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            ESP_LOGD(TAG, "TCP connect to host failed, retrying");
+            vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
         }
     }
 }

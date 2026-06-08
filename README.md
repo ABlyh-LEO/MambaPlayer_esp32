@@ -9,6 +9,8 @@ audio, battery and CAN monitor.
   HTML/CSS/JS resources and does not start a SoftAP configuration page.
 - Wi-Fi runs in STA mode. Configure the computer hotspot SSID/password over USB;
   after DHCP, the firmware connects back to the gateway IP on TCP `37210`.
+  If the host app is not running yet, the firmware keeps retrying the TCP
+  connection while Wi-Fi stays connected.
 - TCP `37210` carries reliable MambaLink control, status, config, audio upload
   and speaker PCM streaming.
 - UDP `37211` carries hello/heartbeat packets.

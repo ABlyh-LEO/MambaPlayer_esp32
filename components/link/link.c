@@ -950,6 +950,16 @@ void link_detach_tcp_socket(int sock)
     }
 }
 
+bool link_is_tcp_socket_attached(int sock)
+{
+    bool attached = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        attached = s_tcp_sock == sock;
+        xSemaphoreGive(s_lock);
+    }
+    return attached;
+}
+
 void link_set_udp_target(uint32_t host_ip_addr, uint16_t hello_port, uint16_t telemetry_port)
 {
     s_udp_host = host_ip_addr;
