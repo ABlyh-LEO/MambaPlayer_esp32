@@ -3,54 +3,73 @@ from __future__ import annotations
 from PySide6 import QtWidgets
 
 
-STYLE = """
+LIGHT_STYLE = """
+QMainWindow, QWidget {
+    background: #f5f7fb;
+    color: #172033;
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-size: 12px;
+}
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #c8d1df;
+    border-radius: 5px;
+    min-height: 26px;
+    padding: 4px 10px;
+}
+QPushButton:hover { background: #eef4ff; border-color: #7aa7e8; }
+QPushButton:checked { background: #2563eb; color: white; border-color: #2563eb; }
+QLineEdit, QComboBox, QSpinBox {
+    background: #ffffff;
+    border: 1px solid #c8d1df;
+    border-radius: 5px;
+    min-height: 24px;
+    padding: 2px 6px;
+}
+QTableWidget, QPlainTextEdit {
+    background: #ffffff;
+    alternate-background-color: #f0f4fa;
+    border: 1px solid #d8e0ec;
+    gridline-color: #e1e7f0;
+    selection-background-color: #cfe2ff;
+}
+QHeaderView::section {
+    background: #e9eef6;
+    color: #46566f;
+    border: 0;
+    border-right: 1px solid #d8e0ec;
+    border-bottom: 1px solid #d8e0ec;
+    padding: 5px;
+}
+QLabel { color: #2b384f; }
+"""
+
+DARK_STYLE = """
 QMainWindow, QWidget {
     background: #11161d;
     color: #d7e3ef;
     font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
     font-size: 12px;
 }
-QDockWidget {
-    titlebar-close-icon: none;
-    titlebar-normal-icon: none;
-}
-QDockWidget::title {
-    background: #18202a;
-    padding: 6px 8px;
-    border-bottom: 1px solid #263241;
-    color: #a9bbcc;
-}
-QToolBar {
-    background: #151c25;
-    border: 0;
-    border-bottom: 1px solid #263241;
-    spacing: 6px;
-    padding: 4px;
-}
-QToolButton, QPushButton {
+QPushButton {
     background: #202b37;
     border: 1px solid #344457;
-    border-radius: 4px;
+    border-radius: 5px;
     color: #d7e3ef;
     min-height: 26px;
-    padding: 3px 9px;
+    padding: 4px 10px;
 }
-QToolButton:hover, QPushButton:hover {
-    background: #2a3848;
-}
-QToolButton:checked, QPushButton:checked {
-    background: #0d6efd;
-    border-color: #3b92ff;
-}
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+QPushButton:hover { background: #2a3848; }
+QPushButton:checked { background: #0d6efd; border-color: #3b92ff; }
+QLineEdit, QComboBox, QSpinBox {
     background: #0c1117;
     border: 1px solid #344457;
-    border-radius: 4px;
+    border-radius: 5px;
     color: #d7e3ef;
     min-height: 24px;
     padding: 2px 6px;
 }
-QTableWidget, QTreeWidget, QPlainTextEdit {
+QTableWidget, QPlainTextEdit {
     background: #0c1117;
     alternate-background-color: #121a23;
     border: 1px solid #263241;
@@ -66,26 +85,15 @@ QHeaderView::section {
     border-bottom: 1px solid #263241;
     padding: 5px;
 }
-QTabWidget::pane {
-    border: 1px solid #263241;
-}
-QTabBar::tab {
-    background: #151c25;
-    color: #a9bbcc;
-    padding: 7px 12px;
-}
-QTabBar::tab:selected {
-    background: #202b37;
-    color: #ffffff;
-}
-QStatusBar {
-    background: #0c1117;
-    border-top: 1px solid #263241;
-    color: #a9bbcc;
-}
+QLabel { color: #d7e3ef; }
 """
+
+
+def apply_light_theme(app: QtWidgets.QApplication) -> None:
+    app.setStyle("Fusion")
+    app.setStyleSheet(LIGHT_STYLE)
 
 
 def apply_dark_theme(app: QtWidgets.QApplication) -> None:
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(DARK_STYLE)

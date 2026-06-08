@@ -17,9 +17,7 @@ void mamba_config_defaults(mamba_config_t *config)
     config->alarm_enabled = true;
     strlcpy(config->alarm_file, MAMBA_DEFAULT_ALARM_FILE, sizeof(config->alarm_file));
     strlcpy(config->power_on_file, MAMBA_DEFAULT_POWER_ON_FILE, sizeof(config->power_on_file));
-    config->can_raw_enabled = true;
-    config->dji_motor_parse_enabled = true;
-    strlcpy(config->can_filter, "0x201-0x208,0x200,0x1FF", sizeof(config->can_filter));
+    config->can_filter[0] = '\0';
     config->wifi_ssid[0] = '\0';
     config->wifi_password[0] = '\0';
     config->tcp_port = MAMBA_LINK_TCP_PORT;

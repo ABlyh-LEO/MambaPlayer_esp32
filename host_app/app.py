@@ -9,12 +9,12 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from host_app.ui.main_window import MainWindow
-from host_app.ui.theme import apply_dark_theme
+from host_app.ui.theme import apply_light_theme
 
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
-    apply_dark_theme(app)
+    apply_light_theme(app)
     window = MainWindow()
     app.aboutToQuit.connect(window.shutdown)
     window.show()

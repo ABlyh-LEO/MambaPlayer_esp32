@@ -43,6 +43,8 @@ esp_err_t can_monitor_init(uint32_t bitrate);
 void can_monitor_apply_config(const mamba_config_t *config);
 void can_monitor_get_snapshot(can_monitor_snapshot_t *out);
 bool can_monitor_receive_frame(can_raw_frame_t *out, uint32_t timeout_ms);
+void can_monitor_set_forward_ids(const uint32_t *ids, uint8_t count);
+uint8_t can_monitor_collect_forward_frames(can_raw_frame_t *out, uint8_t max_count);
 bool can_monitor_parse_rm_feedback(uint32_t id, const uint8_t data[8], rm_motor_state_t *out);
 bool can_monitor_self_test(void);
 

@@ -43,6 +43,9 @@ esp_err_t storage_load_config(mamba_config_t *config)
     if (strcmp(config->device_name, "Mamba C3") == 0) {
         strlcpy(config->device_name, MAMBA_DEFAULT_DEVICE_NAME, sizeof(config->device_name));
     }
+    if (strcmp(config->can_filter, "0x201-0x208,0x200,0x1FF") == 0) {
+        config->can_filter[0] = '\0';
+    }
     nvs_get_u32(nvs, "can_bitrate", &config->can_bitrate);
     nvs_get_u32(nvs, "tel_ms", &config->telemetry_interval_ms);
     nvs_get_u32(nvs, "v_enter", &config->low_voltage_enter_mv);
@@ -63,12 +66,6 @@ esp_err_t storage_load_config(mamba_config_t *config)
     }
     if (nvs_get_u8(nvs, "alarm_en", &value) == ESP_OK) {
         config->alarm_enabled = value != 0;
-    }
-    if (nvs_get_u8(nvs, "can_raw_en", &value) == ESP_OK) {
-        config->can_raw_enabled = value != 0;
-    }
-    if (nvs_get_u8(nvs, "dji_parse", &value) == ESP_OK) {
-        config->dji_motor_parse_enabled = value != 0;
     }
     if (nvs_get_u8(nvs, "cap_enter", &value) == ESP_OK) {
         config->low_capacity_enter_pct = value;
@@ -101,8 +98,6 @@ esp_err_t storage_save_config(const mamba_config_t *config)
     nvs_set_u16(nvs, "udp_tel", config->udp_telemetry_port);
     nvs_set_u8(nvs, "tel_en", config->telemetry_enabled ? 1 : 0);
     nvs_set_u8(nvs, "alarm_en", config->alarm_enabled ? 1 : 0);
-    nvs_set_u8(nvs, "can_raw_en", config->can_raw_enabled ? 1 : 0);
-    nvs_set_u8(nvs, "dji_parse", config->dji_motor_parse_enabled ? 1 : 0);
     nvs_set_u8(nvs, "cap_enter", config->low_capacity_enter_pct);
     nvs_set_u8(nvs, "cap_exit", config->low_capacity_exit_pct);
     nvs_set_blob(nvs, "adc_factor", &config->adc_calibration_factor, sizeof(config->adc_calibration_factor));

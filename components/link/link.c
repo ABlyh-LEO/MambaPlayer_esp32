@@ -58,6 +58,24 @@ typedef struct {
     uint32_t max_file;
 } audio_upload_t;
 
+typedef enum {
+    SOURCE_NONE,
+    SOURCE_ADC_BATTERY_MV,
+    SOURCE_ADC_PIN_MV,
+    SOURCE_ADC_RAW,
+    SOURCE_I2C_VOLTAGE_MV,
+    SOURCE_I2C_CURRENT_MA,
+    SOURCE_I2C_CAPACITY,
+    SOURCE_I2C_TEMPERATURE_C,
+    SOURCE_JUSTFLOAT,
+} selected_source_type_t;
+
+typedef struct {
+    selected_source_type_t type;
+    uint8_t index;
+    char key[32];
+} selected_channel_t;
+
 static const char *TAG = "link";
 static QueueHandle_t s_rx_queue;
 static SemaphoreHandle_t s_lock;
@@ -79,6 +97,8 @@ static volatile uint32_t s_usb_rx_loops;
 static volatile uint32_t s_usb_rx_empty;
 static volatile bool s_upload_active;
 static volatile bool s_audio_stream_active;
+static selected_channel_t s_selected[MAMBA_SELECTED_MAX_CHANNELS];
+static uint8_t s_selected_count;
 
 static int ensure_udp_socket(void)
 {
@@ -118,29 +138,9 @@ static void put64(uint8_t *p, uint64_t v)
     }
 }
 
-static bool json_get_bool(const char *json, const char *key, bool *out)
+static void put_float(uint8_t *p, float v)
 {
-    const char *p = strstr(json, key);
-    if (!p || !out) {
-        return false;
-    }
-    p = strchr(p, ':');
-    if (!p) {
-        return false;
-    }
-    p++;
-    while (*p == ' ' || *p == '"') {
-        p++;
-    }
-    if (strncmp(p, "true", 4) == 0 || *p == '1') {
-        *out = true;
-        return true;
-    }
-    if (strncmp(p, "false", 5) == 0 || *p == '0') {
-        *out = false;
-        return true;
-    }
-    return false;
+    memcpy(p, &v, sizeof(v));
 }
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
@@ -219,6 +219,111 @@ static bool json_get_float(const char *json, const char *key, float *out)
     }
     *out = strtof(p + 1, NULL);
     return true;
+}
+
+static bool parse_source_key(const char *key, selected_channel_t *out)
+{
+    if (!key || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    strlcpy(out->key, key, sizeof(out->key));
+    if (strcmp(key, "adc.battery_mv") == 0) {
+        out->type = SOURCE_ADC_BATTERY_MV;
+        return true;
+    }
+    if (strcmp(key, "adc.pin_mv") == 0) {
+        out->type = SOURCE_ADC_PIN_MV;
+        return true;
+    }
+    if (strcmp(key, "adc.raw") == 0) {
+        out->type = SOURCE_ADC_RAW;
+        return true;
+    }
+    if (strcmp(key, "i2c.voltage_mv") == 0) {
+        out->type = SOURCE_I2C_VOLTAGE_MV;
+        return true;
+    }
+    if (strcmp(key, "i2c.current_ma") == 0) {
+        out->type = SOURCE_I2C_CURRENT_MA;
+        return true;
+    }
+    if (strcmp(key, "i2c.capacity") == 0) {
+        out->type = SOURCE_I2C_CAPACITY;
+        return true;
+    }
+    if (strcmp(key, "i2c.temperature_c") == 0) {
+        out->type = SOURCE_I2C_TEMPERATURE_C;
+        return true;
+    }
+    if (strncmp(key, "justfloat.", 10) == 0) {
+        uint32_t index = (uint32_t)strtoul(key + 10, NULL, 10);
+        if (index < MAMBA_TELEM_JUSTFLOAT_MAX) {
+            out->type = SOURCE_JUSTFLOAT;
+            out->index = (uint8_t)index;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint8_t parse_string_array(const char *json, const char *key, char out[][32], uint8_t max_count)
+{
+    const char *p = strstr(json, key);
+    if (!p || !out || max_count == 0) {
+        return 0;
+    }
+    p = strchr(p, '[');
+    if (!p) {
+        return 0;
+    }
+    uint8_t count = 0;
+    while (*p && *p != ']' && count < max_count) {
+        p = strchr(p, '"');
+        if (!p) {
+            break;
+        }
+        p++;
+        size_t n = 0;
+        while (*p && *p != '"' && n + 1 < 32) {
+            out[count][n++] = *p++;
+        }
+        out[count][n] = 0;
+        if (*p == '"') {
+            count++;
+            p++;
+        }
+    }
+    return count;
+}
+
+static uint8_t parse_u32_array(const char *json, const char *key, uint32_t *out, uint8_t max_count)
+{
+    const char *p = strstr(json, key);
+    if (!p || !out || max_count == 0) {
+        return 0;
+    }
+    p = strchr(p, '[');
+    if (!p) {
+        return 0;
+    }
+    p++;
+    uint8_t count = 0;
+    while (*p && *p != ']' && count < max_count) {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (*p == ']') {
+            break;
+        }
+        char *end = NULL;
+        out[count++] = (uint32_t)strtoul(p, &end, 0) & 0x7ff;
+        if (end == p) {
+            break;
+        }
+        p = end;
+    }
+    return count;
 }
 
 static size_t alarm_max_file_bytes(void)
@@ -374,7 +479,7 @@ static void send_status(uint16_t seq)
         "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\","
         "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu}},"
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
-        "\"raw\":%s,\"dji_parse\":%s,\"filter\":\"%s\"},"
+        "\"forward_filter\":\"%s\",\"parser\":\"host\"},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
         "\"wifi\":{\"ssid\":\"%s\",\"tcp_port\":%u,\"udp_hello\":%u,\"udp_telemetry\":%u}}",
         MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_config.device_name,
@@ -388,9 +493,7 @@ static void send_status(uint16_t seq)
         (unsigned long)audio.write_bytes, (unsigned long)audio.write_errors,
         (unsigned long)audio.last_write_bytes,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
-        (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
-        s_config.can_raw_enabled ? "true" : "false",
-        s_config.dji_motor_parse_enabled ? "true" : "false", s_config.can_filter,
+        (unsigned long)can.rx_count, (unsigned long)can.dropped_count, s_config.can_filter,
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
     if (n > 0 && (size_t)n < MAMBA_LINK_MAX_PAYLOAD) {
@@ -537,15 +640,8 @@ static void handle_set_config(const link_rx_frame_t *frame)
     if (json_get_u32(body, "can_bitrate", &u32) && (u32 == 250000 || u32 == 500000 || u32 == 1000000)) {
         s_config.can_bitrate = u32;
     }
-    if (json_get_u32(body, "telemetry_interval_ms", &u32) && u32 >= 2 && u32 <= 2000) {
+    if (json_get_u32(body, "telemetry_interval_ms", &u32) && u32 >= 1 && u32 <= 2000) {
         s_config.telemetry_interval_ms = u32;
-    }
-    bool b;
-    if (json_get_bool(body, "can_raw_enabled", &b)) {
-        s_config.can_raw_enabled = b;
-    }
-    if (json_get_bool(body, "dji_motor_parse_enabled", &b)) {
-        s_config.dji_motor_parse_enabled = b;
     }
     char filter[sizeof(s_config.can_filter)] = {0};
     if (json_get_string(body, "can_filter", filter, sizeof(filter))) {
@@ -656,6 +752,47 @@ static void handle_audio_stream_stop(const link_rx_frame_t *frame)
     }
 }
 
+static void handle_set_stream_channels(const link_rx_frame_t *frame)
+{
+    char body[MAMBA_LINK_MAX_PAYLOAD + 1];
+    memcpy(body, frame->payload, frame->len);
+    body[frame->len] = 0;
+    char keys[MAMBA_SELECTED_MAX_CHANNELS][32] = {0};
+    uint8_t parsed = parse_string_array(body, "channels", keys, MAMBA_SELECTED_MAX_CHANNELS);
+    selected_channel_t next[MAMBA_SELECTED_MAX_CHANNELS] = {0};
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < parsed; ++i) {
+        if (parse_source_key(keys[i], &next[count])) {
+            count++;
+        }
+    }
+    memcpy(s_selected, next, sizeof(s_selected));
+    s_selected_count = count;
+    send_ack(frame->seq, "stream channels updated");
+}
+
+static void handle_set_can_forward_ids(const link_rx_frame_t *frame)
+{
+    char body[MAMBA_LINK_MAX_PAYLOAD + 1];
+    memcpy(body, frame->payload, frame->len);
+    body[frame->len] = 0;
+    uint32_t ids[MAMBA_CAN_FORWARD_MAX_IDS] = {0};
+    uint8_t count = parse_u32_array(body, "ids", ids, MAMBA_CAN_FORWARD_MAX_IDS);
+    can_monitor_set_forward_ids(ids, count);
+    size_t used = 0;
+    s_config.can_filter[0] = '\0';
+    for (uint8_t i = 0; i < count; ++i) {
+        int n = snprintf(s_config.can_filter + used, sizeof(s_config.can_filter) - used,
+                         "%s0x%03lX", i == 0 ? "" : ",", (unsigned long)ids[i]);
+        if (n < 0 || (size_t)n >= sizeof(s_config.can_filter) - used) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    storage_save_config(&s_config);
+    send_ack(frame->seq, "can forward ids updated");
+}
+
 static void handle_frame(const link_rx_frame_t *frame)
 {
     switch (frame->type) {
@@ -689,6 +826,12 @@ static void handle_frame(const link_rx_frame_t *frame)
         break;
     case MAMBA_LINK_TYPE_AUDIO_STREAM_STOP:
         handle_audio_stream_stop(frame);
+        break;
+    case MAMBA_LINK_TYPE_SET_STREAM_CHANNELS:
+        handle_set_stream_channels(frame);
+        break;
+    case MAMBA_LINK_TYPE_SET_CAN_FORWARD_IDS:
+        handle_set_can_forward_ids(frame);
         break;
     default:
         send_error(frame->seq, "unknown type");
@@ -818,45 +961,65 @@ static void hello_task(void *arg)
     }
 }
 
-static void publish_adc_batch(void)
+static float selected_value(const selected_channel_t *channel, const battery_snapshot_t *bat,
+                            const telemetry_adc_sample_t *adc, bool has_adc,
+                            const telemetry_justfloat_frame_t *jf, bool has_jf)
 {
-    telemetry_adc_sample_t samples[8];
-    uint16_t count = 0;
-    while (count < 8 && telemetry_mux_receive_adc(&samples[count], 0)) {
-        count++;
+    switch (channel->type) {
+    case SOURCE_ADC_BATTERY_MV:
+        return has_adc ? (float)adc->battery_mv : 0.0f;
+    case SOURCE_ADC_PIN_MV:
+        return has_adc ? (float)adc->pin_mv : 0.0f;
+    case SOURCE_ADC_RAW:
+        return has_adc ? (float)adc->raw : 0.0f;
+    case SOURCE_I2C_VOLTAGE_MV:
+        return (float)bat->i2c_voltage_mv;
+    case SOURCE_I2C_CURRENT_MA:
+        return (float)bat->current_ma;
+    case SOURCE_I2C_CAPACITY:
+        return (float)bat->capacity_percent;
+    case SOURCE_I2C_TEMPERATURE_C:
+        return (float)bat->temperature_decic / 10.0f;
+    case SOURCE_JUSTFLOAT:
+        return (has_jf && channel->index < jf->count) ? jf->values[channel->index] : 0.0f;
+    default:
+        return 0.0f;
     }
-    if (count == 0) {
-        return;
-    }
-    uint8_t payload[12 + 8 * 8];
-    put32(payload, samples[0].sample_index);
-    uint32_t interval = count > 1 ? (uint32_t)(samples[1].timestamp_us - samples[0].timestamp_us) : 2000;
-    put32(payload + 4, interval);
-    put16(payload + 8, count);
-    put16(payload + 10, (uint16_t)(telemetry_mux_dropped_adc() > 0xffff ? 0xffff : telemetry_mux_dropped_adc()));
-    for (uint16_t i = 0; i < count; ++i) {
-        uint8_t *p = payload + 12 + i * 8;
-        put32(p, samples[i].battery_mv);
-        put16(p + 4, samples[i].pin_mv);
-        put16(p + 6, samples[i].raw);
-    }
-    send_udp_payload(MAMBA_STREAM_ADC_BATCH, payload, 12 + count * 8);
 }
 
-static void publish_can_batch(void)
+static void publish_selected_values(void)
 {
-    telemetry_can_frame_t frames[32];
-    uint16_t count = 0;
-    while (count < 32 && telemetry_mux_receive_can(&frames[count], 0)) {
-        count++;
-    }
+    uint8_t count = s_selected_count;
     if (count == 0) {
         return;
     }
-    uint8_t payload[4 + 32 * 24];
+    battery_snapshot_t bat;
+    telemetry_adc_sample_t adc = {0};
+    telemetry_justfloat_frame_t jf = {0};
+    battery_get_snapshot(&bat);
+    bool has_adc = telemetry_mux_get_latest_adc(&adc);
+    bool has_jf = telemetry_mux_get_latest_justfloat(&jf);
+    uint8_t payload[4 + MAMBA_SELECTED_MAX_CHANNELS * sizeof(float)];
+    payload[0] = count;
+    payload[1] = 0;
+    put16(payload + 2, 0);
+    for (uint8_t i = 0; i < count; ++i) {
+        put_float(payload + 4 + i * sizeof(float), selected_value(&s_selected[i], &bat, &adc, has_adc, &jf, has_jf));
+    }
+    send_udp_payload(MAMBA_STREAM_SELECTED_VALUES, payload, 4 + count * sizeof(float));
+}
+
+static void publish_can_last(void)
+{
+    can_raw_frame_t frames[MAMBA_CAN_FORWARD_MAX_IDS];
+    uint8_t count = can_monitor_collect_forward_frames(frames, MAMBA_CAN_FORWARD_MAX_IDS);
+    if (count == 0) {
+        return;
+    }
+    uint8_t payload[4 + MAMBA_CAN_FORWARD_MAX_IDS * 24];
     put16(payload, count);
-    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_can() > 0xffff ? 0xffff : telemetry_mux_dropped_can()));
-    for (uint16_t i = 0; i < count; ++i) {
+    put16(payload + 2, 0);
+    for (uint8_t i = 0; i < count; ++i) {
         uint8_t *p = payload + 4 + i * 24;
         put32(p, frames[i].id);
         p[4] = frames[i].dlc;
@@ -865,88 +1028,62 @@ static void publish_can_batch(void)
         memset(p + 16, 0, 8);
         memcpy(p + 16, frames[i].data, frames[i].dlc > 8 ? 8 : frames[i].dlc);
     }
-    send_udp_payload(MAMBA_STREAM_CAN_RAW, payload, 4 + count * 24);
+    send_udp_payload(MAMBA_STREAM_CAN_LAST, payload, 4 + count * 24);
 }
 
-static void publish_rm_batch(void)
+static void publish_catalog(uint32_t tick)
 {
-    telemetry_rm_motor_t motors[16];
-    uint16_t count = 0;
-    while (count < 16 && telemetry_mux_receive_rm_motor(&motors[count], 0)) {
-        count++;
-    }
-    if (count == 0) {
-        return;
-    }
-    uint8_t payload[4 + 16 * 24];
-    put16(payload, count);
-    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_rm_motor() > 0xffff ? 0xffff : telemetry_mux_dropped_rm_motor()));
-    for (uint16_t i = 0; i < count; ++i) {
-        uint8_t *p = payload + 4 + i * 24;
-        put64(p, motors[i].timestamp_us);
-        p[8] = motors[i].motor_id;
-        p[9] = motors[i].temperature;
-        p[10] = motors[i].error;
-        p[11] = 0;
-        put16(p + 12, motors[i].angle);
-        put16(p + 14, (uint16_t)motors[i].rpm);
-        put16(p + 16, (uint16_t)motors[i].torque_current);
-        put16(p + 18, (uint16_t)motors[i].commanded_current);
-        put32(p + 20, 0);
-    }
-    send_udp_payload(MAMBA_STREAM_RM_MOTOR, payload, 4 + count * 24);
-}
-
-static void publish_justfloat_batch(void)
-{
-    uint8_t payload[900];
-    uint16_t frames = 0;
-    size_t used = 4;
-    telemetry_justfloat_frame_t frame;
-    while (frames < 8 && telemetry_mux_receive_justfloat(&frame, 0)) {
-        size_t need = 12 + frame.count * sizeof(float);
-        if (frame.count > MAMBA_TELEM_JUSTFLOAT_MAX || used + need > sizeof(payload)) {
-            break;
-        }
-        uint8_t *p = payload + used;
-        put64(p, frame.timestamp_us);
-        p[8] = frame.count;
-        p[9] = 0;
-        put16(p + 10, 0);
-        memcpy(p + 12, frame.values, frame.count * sizeof(float));
-        used += need;
-        frames++;
-    }
-    if (frames == 0) {
-        return;
-    }
-    put16(payload, frames);
-    put16(payload + 2, (uint16_t)(telemetry_mux_dropped_justfloat() > 0xffff ? 0xffff : telemetry_mux_dropped_justfloat()));
-    send_udp_payload(MAMBA_STREAM_JUSTFLOAT, payload, used);
-}
-
-static void publish_low_rate_status(uint32_t tick)
-{
-    if ((tick % 250) != 0) {
+    if ((tick % 500) != 0) {
         return;
     }
     battery_snapshot_t bat;
     alarm_status_t alarm;
+    can_monitor_snapshot_t can;
     battery_get_snapshot(&bat);
     alarm_get_status(&alarm);
-    char json[256];
+    can_monitor_get_snapshot(&can);
+    char json[900];
     int n = snprintf(json, sizeof(json),
-        "{\"fused_mv\":%lu,\"adc_mv\":%lu,\"capacity\":%u,\"alarm\":%s,\"sample\":%lu,"
-        "\"usb_rx\":%lu,\"usb_frames\":%lu,\"usb_loops\":%lu,\"usb_empty\":%lu,\"heap\":%lu}",
-        (unsigned long)bat.fused_voltage_mv, (unsigned long)bat.adc_battery_mv,
-        bat.capacity_percent, alarm.active ? "true" : "false", (unsigned long)bat.sample_count,
-        (unsigned long)s_usb_rx_bytes, (unsigned long)s_usb_rx_frames,
-        (unsigned long)s_usb_rx_loops, (unsigned long)s_usb_rx_empty,
-        (unsigned long)esp_get_free_heap_size());
-    if (n > 0) {
-        send_udp_payload(MAMBA_STREAM_BATTERY, json, (size_t)n);
+        "{\"type\":\"catalog\",\"fw\":\"%s\",\"proto\":%u,\"selected\":%u,"
+        "\"sources\":["
+        "{\"key\":\"adc.battery_mv\",\"name\":\"ADC Battery\",\"unit\":\"mV\",\"value\":%lu,\"rate_hz\":500},"
+        "{\"key\":\"adc.pin_mv\",\"name\":\"ADC Pin\",\"unit\":\"mV\",\"value\":%d,\"rate_hz\":500},"
+        "{\"key\":\"adc.raw\",\"name\":\"ADC Raw\",\"unit\":\"\",\"value\":%d,\"rate_hz\":500},"
+        "{\"key\":\"i2c.voltage_mv\",\"name\":\"I2C Voltage\",\"unit\":\"mV\",\"value\":%ld,\"rate_hz\":2},"
+        "{\"key\":\"i2c.current_ma\",\"name\":\"I2C Current\",\"unit\":\"mA\",\"value\":%ld,\"rate_hz\":2},"
+        "{\"key\":\"i2c.capacity\",\"name\":\"I2C Capacity\",\"unit\":\"%%\",\"value\":%u,\"rate_hz\":2},"
+        "{\"key\":\"i2c.temperature_c\",\"name\":\"I2C Temp\",\"unit\":\"C\",\"value\":%.1f,\"rate_hz\":2}",
+        MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_selected_count,
+        (unsigned long)bat.adc_battery_mv, bat.adc_pin_mv, bat.adc_raw,
+        (long)bat.i2c_voltage_mv, (long)bat.current_ma, bat.capacity_percent,
+        (double)bat.temperature_decic / 10.0);
+    if (n < 0 || n >= (int)sizeof(json)) {
+        return;
+    }
+    size_t used = (size_t)n;
+    telemetry_justfloat_frame_t jf = {0};
+    if (telemetry_mux_get_latest_justfloat(&jf)) {
+        for (uint8_t i = 0; i < jf.count && i < MAMBA_TELEM_JUSTFLOAT_MAX; ++i) {
+            n = snprintf(json + used, sizeof(json) - used,
+                         ",{\"key\":\"justfloat.%u\",\"name\":\"JustFloat %u\",\"unit\":\"\",\"value\":%.5g,\"rate_hz\":1000}",
+                         i, i, (double)jf.values[i]);
+            if (n < 0 || n >= (int)(sizeof(json) - used)) {
+                return;
+            }
+            used += (size_t)n;
+        }
+    }
+    n = snprintf(json + used, sizeof(json) - used,
+                 "],\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu},"
+                 "\"alarm\":%s,\"heap\":%lu}",
+                 can.started ? "true" : "false", (unsigned long)can.bitrate,
+                 (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
+                 alarm.active ? "true" : "false", (unsigned long)esp_get_free_heap_size());
+    if (n > 0 && n < (int)(sizeof(json) - used)) {
+        used += (size_t)n;
+        send_udp_payload(MAMBA_STREAM_CATALOG, json, used);
         if (!s_upload_active) {
-            send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, (size_t)n);
+            send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, used);
         }
     }
 }
@@ -956,7 +1093,7 @@ static void telemetry_task(void *arg)
     uint32_t tick = 0;
     while (true) {
         uint32_t interval_ms = s_config.telemetry_interval_ms;
-        if (interval_ms < 2 || interval_ms > 2000) {
+        if (interval_ms < 1 || interval_ms > 2000) {
             interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
         }
         if (s_audio_stream_active) {
@@ -964,11 +1101,9 @@ static void telemetry_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(interval_ms));
             continue;
         }
-        publish_adc_batch();
-        publish_can_batch();
-        publish_rm_batch();
-        publish_justfloat_batch();
-        publish_low_rate_status(tick++);
+        publish_selected_values();
+        publish_can_last();
+        publish_catalog(tick++);
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
     }
 }

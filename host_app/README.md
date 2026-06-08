@@ -1,9 +1,8 @@
-# Mamba Host App
+# Mamba Host Data Hub
 
-Desktop-side monitor and configuration tool for the Mamba ESP32-C3 firmware.
-The main window is a dark VOFA+-style dock workspace: waveform in the center,
-channels on the left, connection/measurement properties on the right, and
-CAN/status/log data at the bottom.
+Desktop-side data hub and configuration tool for Mamba ESP32-C3 firmware.
+The app focuses on routing and configuration; VOFA+ is responsible for waveform
+visualization.
 
 ## Run
 
@@ -15,40 +14,38 @@ host_app\.venv\Scripts\python.exe host_app\app.py
 
 The app listens on:
 
-- TCP `37210` for reliable MambaLink control and audio upload.
+- TCP `37210` for reliable MambaLink v2 control and audio upload.
 - UDP `37211` for device hello packets.
-- UDP `37212` for best-effort realtime telemetry.
+- UDP `37212` for v2 realtime telemetry.
 
 USB Serial/JTAG uses the same MambaLink frame format as TCP. The GUI sends
 control and audio upload over USB when a device is connected; if USB is not
 connected, it uses the active TCP device connection.
 
-The firmware uses Wi-Fi STA mode and connects back to this app at the DHCP
-gateway IP. Configure hotspot credentials from the Wi-Fi provisioning panel over
-USB once, then network-only control and audio upload can work after reconnect.
+## Data Hub Workflow
 
-## Wave Workspace
+- The firmware sends a low-rate source catalog. The left table shows available
+  keys, latest values, units and nominal source rates.
+- Add up to 16 source keys to the firmware channel list, then apply the 1 kHz
+  stream configuration. These are the only values sampled into the firmware-side
+  selected-values UDP stream.
+- Add any source key to the VOFA table. The host sends enabled VOFA rows at
+  1 kHz as JustFloat UDP frames.
+- VOFA+ defaults: remote IP `127.0.0.1`, remote port `1346`, local port `1347`.
+  Configure VOFA+ to receive JustFloat over UDP on the matching port.
+- Project settings are saved as `host_app\runtime\last_project.mamba.json`.
+  This stores VOFA address, firmware channels, CAN IDs, VOFA mappings and theme.
 
-- The center wave panel binds enabled channels against the time axis `T`.
-- Toolbar controls include Run/Pause, Clear, Auto Y, Auto X/Y, Follow Tail,
-  visible window `dt`, cursors, and PNG export.
-- The channel panel controls visibility and color, and shows latest/min/max
-  values plus drop counts.
-- Enable cursors, then double-click the wave area twice to place vertical
-  cursors; the property panel reports `dt` and per-channel `dY`.
-- Mock mode generates battery, JustFloat and RoboMaster-like channels for
-  no-hardware UI checks.
+## CAN
 
-## Telemetry
-
-- ADC samples are batched by the firmware at the configured telemetry interval,
-  defaulting to `4 ms` for a 500 Hz ADC source.
-- UART0 JustFloat is parsed as up to 16 little-endian float32 values followed by
-  the VOFA+ tail `00 00 80 7F`, then forwarded in realtime batches.
-- CAN raw and RoboMaster/DJI motor summaries are separate streams. The CAN panel
-  can configure raw forwarding, the ID filter expression, and DJI parsing.
-- UDP streams are best-effort. Sequence gaps are counted and displayed instead
-  of retransmitted.
+- CAN raw forwarding is disabled by default in the firmware.
+- Enter up to 16 standard CAN IDs, for example `0x201,0x202,0x200`, and apply.
+- The firmware stores the latest unforwarded frame per configured ID and sends
+  each ID at most once per 1 ms tick.
+- The host table shows the latest frame, timestamp, DLC and data bytes.
+- DJI/RoboMaster feedback parsing is host-side. For `0x201-0x208`, the parser
+  exposes `angle`, `rpm`, `torque_current`, `temperature` and `error` as source
+  keys such as `can.0x201.rpm`; map these to VOFA channels as needed.
 
 ## Audio
 
@@ -57,23 +54,21 @@ USB once, then network-only control and audio upload can work after reconnect.
 - The host converts uploads to `16 kHz` mono IMA ADPCM WAV and applies peak
   normalization before transfer.
 - Power-on audio is limited to 10 seconds. Alarm audio uses the remaining
-  storage budget reported by firmware status; without a status packet the app
-  assumes the current `0x250000` SPIFFS partition.
+  storage budget reported by the firmware partition assumptions.
 - Speaker Mode streams `16 kHz` mono PCM to the firmware. On Windows it prefers
   VB-CABLE: set Windows or the target player output device to `CABLE Input
   (VB-Audio Virtual Cable)`, then the app captures `CABLE Output (VB-Audio
-  Virtual Cable)`. This makes Mamba behave like the selected playback device
-  instead of depending on the physical PC speakers. If VB-CABLE is unavailable,
-  the app falls back to loopback-like capture inputs such as Stereo Mix.
-- VB-CABLE provides the virtual audio device; the app only captures it and
-  forwards PCM to the ESP32. It does not install a driver or create a Windows
-  audio endpoint by itself.
+  Virtual Cable)`.
 
-## Diagnostics
+## Probe Commands
 
 ```powershell
 host_app\.venv\Scripts\python.exe -m host_app.probe tcp-status --host 127.0.0.1
 host_app\.venv\Scripts\python.exe -m host_app.probe udp-once --port 37212
+host_app\.venv\Scripts\python.exe -m host_app.probe catalog --port 37212
+host_app\.venv\Scripts\python.exe -m host_app.probe set-stream adc.battery_mv adc.raw justfloat.0
+host_app\.venv\Scripts\python.exe -m host_app.probe can-filter 0x201 0x202
+host_app\.venv\Scripts\python.exe -m host_app.probe vofa-test 1.0 -1.0 0.5
 host_app\.venv\Scripts\python.exe -m host_app.probe usb-wifi --port COM8 --ssid MyHotspot --password password
 host_app\.venv\Scripts\python.exe -m host_app.probe usb-upload-audio --port COM8 --kind alarm --file .\alarm.mp3
 host_app\.venv\Scripts\python.exe -m host_app.probe snapshot
@@ -81,3 +76,12 @@ host_app\.venv\Scripts\python.exe -m host_app.probe snapshot
 
 `probe snapshot` reads `host_app\runtime\state.json`, which the GUI writes for
 scripted debugging. Runtime snapshots are intentionally ignored by git.
+
+## Packaging Preparation
+
+The repository includes `host_app\mamba_host.spec` for PyInstaller onedir
+packaging. Build manually when needed:
+
+```powershell
+host_app\.venv\Scripts\pyinstaller.exe host_app\mamba_host.spec
+```

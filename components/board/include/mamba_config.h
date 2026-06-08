@@ -33,8 +33,8 @@ extern "C" {
 #define MAMBA_UART_JUSTFLOAT_RX_GPIO GPIO_NUM_20
 #define MAMBA_UART_JUSTFLOAT_BAUD 1000000
 
-#define MAMBA_FIRMWARE_VERSION "0.2.0"
-#define MAMBA_PROTOCOL_VERSION 1
+#define MAMBA_FIRMWARE_VERSION "0.3.0"
+#define MAMBA_PROTOCOL_VERSION 2
 #define MAMBA_LINK_TCP_PORT 37210
 #define MAMBA_LINK_UDP_HELLO_PORT 37211
 #define MAMBA_LINK_UDP_TELEMETRY_PORT 37212
@@ -45,7 +45,7 @@ extern "C" {
 #define MAMBA_ALARM_DIR "/spiffs"
 #define MAMBA_DEFAULT_ALARM_FILE "/spiffs/alarm.wav"
 #define MAMBA_DEFAULT_POWER_ON_FILE "/spiffs/poweron.wav"
-#define MAMBA_TELEMETRY_BATCH_INTERVAL_MS 4
+#define MAMBA_TELEMETRY_BATCH_INTERVAL_MS 1
 #define MAMBA_AUDIO_SAMPLE_RATE_HZ 16000
 #define MAMBA_AUDIO_CHANNELS 1
 #define MAMBA_AUDIO_PCM_BITS_PER_SAMPLE 16
@@ -73,8 +73,6 @@ typedef struct {
     bool alarm_enabled;
     char alarm_file[64];
     char power_on_file[64];
-    bool can_raw_enabled;
-    bool dji_motor_parse_enabled;
     char can_filter[96];
     char wifi_ssid[33];
     char wifi_password[65];

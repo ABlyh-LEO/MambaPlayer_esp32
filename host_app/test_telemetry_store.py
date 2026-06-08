@@ -10,7 +10,7 @@ from PySide6 import QtWidgets
 
 from .telemetry.store import TelemetryStore
 from .ui.main_window import MainWindow
-from .ui.theme import apply_dark_theme
+from .ui.theme import apply_light_theme
 
 
 class TelemetryStoreTests(unittest.TestCase):
@@ -57,20 +57,19 @@ class HostGuiSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        apply_dark_theme(cls.app)
+        apply_light_theme(cls.app)
 
-    def test_main_window_renders_mock_waveform(self):
+    def test_main_window_renders_mock_data_hub(self):
         window = MainWindow(start_workers=False)
         try:
             window._mock_tick()
             self.app.processEvents()
-            window.wave.refresh()
-            self.app.processEvents()
-            self.assertGreater(len(window.store.channels), 0)
-            self.assertGreater(sum(ch.count for ch in window.store.channels.values()), 0)
+            self.assertGreater(len(window.sources), 0)
+            self.assertGreater(window.sources_table.rowCount(), 0)
+            self.assertGreater(window.can_table.rowCount(), 0)
             with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "wave.png"
-                image = window.wave.grab().toImage()
+                path = Path(tmp) / "hub.png"
+                image = window.grab().toImage()
                 self.assertFalse(image.isNull())
                 self.assertTrue(image.save(str(path)))
                 self.assertGreater(path.stat().st_size, 0)

@@ -21,6 +21,8 @@ try:
         TYPE_ERROR,
         TYPE_GET_STATUS,
         TYPE_HELLO,
+        TYPE_SET_CAN_FORWARD_IDS,
+        TYPE_SET_STREAM_CHANNELS,
         TYPE_STATUS,
         TYPE_WIFI_CONFIG,
         FrameParser,
@@ -28,6 +30,7 @@ try:
         encode_frame,
     )
     from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, convert_to_mamba_wav
+    from .router import encode_justfloat
 except ImportError:
     from mamba_link import (
         TYPE_ACK,
@@ -37,6 +40,8 @@ except ImportError:
         TYPE_ERROR,
         TYPE_GET_STATUS,
         TYPE_HELLO,
+        TYPE_SET_CAN_FORWARD_IDS,
+        TYPE_SET_STREAM_CHANNELS,
         TYPE_STATUS,
         TYPE_WIFI_CONFIG,
         FrameParser,
@@ -44,6 +49,7 @@ except ImportError:
         encode_frame,
     )
     from audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, convert_to_mamba_wav
+    from router import encode_justfloat
 
 
 AUDIO_CHUNK_SIZE = 384
@@ -82,6 +88,46 @@ def udp_listen(port: int, timeout: float) -> int:
         print(json.dumps(item, ensure_ascii=False))
     else:
         print(json.dumps({"addr": addr[0], "payload": data.decode(errors="replace")}, ensure_ascii=False))
+    return 0
+
+
+def tcp_send_wait(host: str, port: int, msg_type: int, payload: bytes, timeout: float) -> bytes:
+    parser = FrameParser()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(encode_frame(msg_type, payload, 1))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = sock.recv(2048)
+            for frame in parser.feed(data):
+                if frame.seq != 1:
+                    continue
+                if frame.msg_type == TYPE_ACK:
+                    return frame.payload
+                if frame.msg_type == TYPE_ERROR:
+                    raise RuntimeError(frame.payload.decode(errors="replace"))
+    raise TimeoutError("timeout waiting for ACK")
+
+
+def tcp_set_stream(host: str, port: int, channels: list[str], timeout: float) -> int:
+    response = tcp_send_wait(host, port, TYPE_SET_STREAM_CHANNELS, json.dumps({"channels": channels}).encode(), timeout)
+    print(response.decode(errors="replace"))
+    return 0
+
+
+def tcp_can_filter(host: str, port: int, ids: list[str], timeout: float) -> int:
+    parsed = [int(item, 0) for item in ids]
+    response = tcp_send_wait(host, port, TYPE_SET_CAN_FORWARD_IDS, json.dumps({"ids": parsed}).encode(), timeout)
+    print(response.decode(errors="replace"))
+    return 0
+
+
+def vofa_test(host: str, remote_port: int, local_port: int, values: list[float]) -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", local_port))
+    sock.sendto(encode_justfloat(values), (host, remote_port))
+    sock.close()
+    print(json.dumps({"sent": values, "remote": f"{host}:{remote_port}", "local_port": local_port}))
     return 0
 
 
@@ -244,6 +290,24 @@ def main(argv: list[str] | None = None) -> int:
     p_upload.add_argument("--trim", action="store_true")
     p_snapshot = sub.add_parser("snapshot")
     p_snapshot.add_argument("--path")
+    p_stream = sub.add_parser("set-stream")
+    p_stream.add_argument("--host", default="127.0.0.1")
+    p_stream.add_argument("--port", type=int, default=37210)
+    p_stream.add_argument("--timeout", type=float, default=3.0)
+    p_stream.add_argument("channels", nargs="*")
+    p_can = sub.add_parser("can-filter")
+    p_can.add_argument("--host", default="127.0.0.1")
+    p_can.add_argument("--port", type=int, default=37210)
+    p_can.add_argument("--timeout", type=float, default=3.0)
+    p_can.add_argument("ids", nargs="*")
+    p_catalog = sub.add_parser("catalog")
+    p_catalog.add_argument("--port", type=int, default=37212)
+    p_catalog.add_argument("--timeout", type=float, default=5.0)
+    p_vofa = sub.add_parser("vofa-test")
+    p_vofa.add_argument("--host", default="127.0.0.1")
+    p_vofa.add_argument("--remote-port", type=int, default=1346)
+    p_vofa.add_argument("--local-port", type=int, default=1347)
+    p_vofa.add_argument("values", nargs="*", type=float)
     args = parser.parse_args(argv)
     if args.cmd == "tcp-status":
         return tcp_status(args.host, args.port, args.timeout)
@@ -257,6 +321,14 @@ def main(argv: list[str] | None = None) -> int:
         return usb_upload_audio(args.port, args.kind, args.file, args.baud, args.timeout, args.max_seconds, args.trim)
     if args.cmd == "snapshot":
         return snapshot(args.path)
+    if args.cmd == "set-stream":
+        return tcp_set_stream(args.host, args.port, args.channels, args.timeout)
+    if args.cmd == "can-filter":
+        return tcp_can_filter(args.host, args.port, args.ids, args.timeout)
+    if args.cmd == "catalog":
+        return udp_listen(args.port, args.timeout)
+    if args.cmd == "vofa-test":
+        return vofa_test(args.host, args.remote_port, args.local_port, args.values or [1.0, -1.0])
     return 2
 
 

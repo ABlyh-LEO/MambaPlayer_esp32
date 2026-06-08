@@ -25,9 +25,10 @@ static QueueHandle_t s_rx_queue;
 static SemaphoreHandle_t s_lock;
 static twai_node_handle_t s_node;
 static can_monitor_snapshot_t s_snapshot;
-static bool s_can_raw_enabled = true;
-static bool s_dji_parse_enabled = true;
-static char s_filter[96] = "0x201-0x208,0x200,0x1FF";
+static uint32_t s_forward_ids[MAMBA_CAN_FORWARD_MAX_IDS];
+static can_raw_frame_t s_forward_latest[MAMBA_CAN_FORWARD_MAX_IDS];
+static bool s_forward_dirty[MAMBA_CAN_FORWARD_MAX_IDS];
+static uint8_t s_forward_count;
 
 static int16_t be_i16(const uint8_t *p)
 {
@@ -64,34 +65,14 @@ static uint32_t parse_id_token(const char *text, const char **end)
     return value;
 }
 
-static bool can_id_allowed(uint32_t id)
+static int forward_slot_for_id(uint32_t id)
 {
-    if (s_filter[0] == '\0') {
-        return true;
+    for (uint8_t i = 0; i < s_forward_count; ++i) {
+        if (s_forward_ids[i] == id) {
+            return i;
+        }
     }
-    const char *p = s_filter;
-    while (*p) {
-        const char *after_start = NULL;
-        uint32_t start = parse_id_token(p, &after_start);
-        if (after_start == p) {
-            break;
-        }
-        uint32_t end = start;
-        if (*after_start == '-') {
-            const char *after_end = NULL;
-            end = parse_id_token(after_start + 1, &after_end);
-            after_start = after_end;
-        }
-        if (id >= start && id <= end) {
-            return true;
-        }
-        p = strchr(after_start, ',');
-        if (!p) {
-            break;
-        }
-        p++;
-    }
-    return false;
+    return -1;
 }
 
 bool can_monitor_parse_rm_feedback(uint32_t id, const uint8_t data[8], rm_motor_state_t *out)
@@ -116,18 +97,6 @@ bool can_monitor_self_test(void)
     return can_monitor_parse_rm_feedback(0x201, data, &state) &&
            state.angle == 0x1234 && state.rpm == -100 && state.torque_current == 42 &&
            state.temperature == 55 && state.error == 1;
-}
-
-static void parse_control_frame_locked(uint32_t id, const uint8_t data[8])
-{
-    if (id != 0x200 && id != 0x1FF) {
-        return;
-    }
-    int base = id == 0x200 ? 0 : 4;
-    for (int i = 0; i < 4; ++i) {
-        s_snapshot.motors[base + i].commanded_current = be_i16(data + i * 2);
-        s_snapshot.motors[base + i].valid = true;
-    }
 }
 
 static bool IRAM_ATTR rx_done_cb(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
@@ -163,37 +132,19 @@ static void process_frame(const twai_rx_item_t *item)
     }
     s_snapshot.rx_count++;
     uint32_t id = item->frame.header.id;
-    if (!item->frame.header.ide && item->frame.header.dlc >= 8) {
-        if (id >= 0x201 && id <= 0x208) {
-            can_monitor_parse_rm_feedback(id, item->data, &s_snapshot.motors[id - 0x201]);
-            if (s_dji_parse_enabled) {
-                rm_motor_state_t *m = &s_snapshot.motors[id - 0x201];
-                telemetry_rm_motor_t rm = {
-                    .motor_id = (uint8_t)(id - 0x200),
-                    .angle = m->angle,
-                    .rpm = m->rpm,
-                    .torque_current = m->torque_current,
-                    .commanded_current = m->commanded_current,
-                    .temperature = m->temperature,
-                    .error = m->error,
-                    .timestamp_us = item->frame.header.timestamp,
-                };
-                telemetry_mux_publish_rm_motor(&rm);
-            }
-        } else {
-            parse_control_frame_locked(id, item->data);
+    if (!item->frame.header.ide) {
+        int slot = forward_slot_for_id(id);
+        if (slot >= 0) {
+            s_forward_latest[slot] = (can_raw_frame_t) {
+                .id = id,
+                .dlc = item->frame.header.dlc > CAN_MONITOR_MAX_DATA ? CAN_MONITOR_MAX_DATA : item->frame.header.dlc,
+                .timestamp_us = item->frame.header.timestamp,
+            };
+            memcpy(s_forward_latest[slot].data, item->data, s_forward_latest[slot].dlc);
+            s_forward_dirty[slot] = true;
         }
     }
     xSemaphoreGive(s_lock);
-    if (s_can_raw_enabled && can_id_allowed(id)) {
-        telemetry_can_frame_t frame = {
-            .id = id,
-            .dlc = item->frame.header.dlc > MAMBA_TELEM_CAN_MAX_DATA ? MAMBA_TELEM_CAN_MAX_DATA : item->frame.header.dlc,
-            .timestamp_us = item->frame.header.timestamp,
-        };
-        memcpy(frame.data, item->data, frame.dlc);
-        telemetry_mux_publish_can(&frame);
-    }
 }
 
 static void can_task(void *arg)
@@ -225,14 +176,69 @@ bool can_monitor_receive_frame(can_raw_frame_t *out, uint32_t timeout_ms)
     return true;
 }
 
+void can_monitor_set_forward_ids(const uint32_t *ids, uint8_t count)
+{
+    if (count > MAMBA_CAN_FORWARD_MAX_IDS) {
+        count = MAMBA_CAN_FORWARD_MAX_IDS;
+    }
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+    memset(s_forward_ids, 0, sizeof(s_forward_ids));
+    memset(s_forward_latest, 0, sizeof(s_forward_latest));
+    memset(s_forward_dirty, 0, sizeof(s_forward_dirty));
+    s_forward_count = 0;
+    for (uint8_t i = 0; i < count; ++i) {
+        if (ids) {
+            s_forward_ids[s_forward_count++] = ids[i] & 0x7ff;
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
+
+uint8_t can_monitor_collect_forward_frames(can_raw_frame_t *out, uint8_t max_count)
+{
+    if (!out || max_count == 0 || !s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(2)) != pdTRUE) {
+        return 0;
+    }
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < s_forward_count && count < max_count; ++i) {
+        if (!s_forward_dirty[i]) {
+            continue;
+        }
+        out[count++] = s_forward_latest[i];
+        s_forward_dirty[i] = false;
+    }
+    xSemaphoreGive(s_lock);
+    return count;
+}
+
 void can_monitor_apply_config(const mamba_config_t *config)
 {
     if (!config) {
         return;
     }
-    s_can_raw_enabled = config->can_raw_enabled;
-    s_dji_parse_enabled = config->dji_motor_parse_enabled;
-    strlcpy(s_filter, config->can_filter, sizeof(s_filter));
+    if (config->can_filter[0] == '\0') {
+        can_monitor_set_forward_ids(NULL, 0);
+        return;
+    }
+    uint32_t ids[MAMBA_CAN_FORWARD_MAX_IDS];
+    uint8_t count = 0;
+    const char *p = config->can_filter;
+    while (*p && count < MAMBA_CAN_FORWARD_MAX_IDS) {
+        const char *after = NULL;
+        uint32_t id = parse_id_token(p, &after);
+        if (after == p) {
+            break;
+        }
+        ids[count++] = id & 0x7ff;
+        p = strchr(after, ',');
+        if (!p) {
+            break;
+        }
+        p++;
+    }
+    can_monitor_set_forward_ids(ids, count);
 }
 
 void can_monitor_get_snapshot(can_monitor_snapshot_t *out)
@@ -291,8 +297,7 @@ esp_err_t can_monitor_init(uint32_t bitrate)
     ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "twai enable");
     s_snapshot.started = true;
     s_snapshot.bitrate = bitrate;
-    s_can_raw_enabled = true;
-    s_dji_parse_enabled = true;
+    can_monitor_set_forward_ids(NULL, 0);
     BaseType_t ok = xTaskCreate(can_task, "can_rx_task", 4096, s_telemetry_queue, 6, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "can task");
     ESP_LOGI(TAG, "TWAI listen-only started at %lu bps, parser self-test=%s",

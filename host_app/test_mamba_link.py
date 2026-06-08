@@ -9,16 +9,14 @@ import numpy as np
 
 from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, TARGET_RATE, convert_to_mamba_wav, normalize_peak
 from .mamba_link import (
-    STREAM_JUSTFLOAT,
+    STREAM_SELECTED_VALUES,
     TYPE_HELLO,
     FrameParser,
     crc16_ccitt,
     decode_udp_packet,
     encode_frame,
-    parse_justfloat_payload,
-    parse_adc_batch_payload,
-    parse_rm_motor_payload,
 )
+from .router import encode_justfloat, parse_can_last, parse_dji_motor, parse_selected_values, save_project, load_project
 
 
 class ProtocolTests(unittest.TestCase):
@@ -34,35 +32,39 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(out[0].seq, 42)
         self.assertEqual(out[0].payload, b'{"ok":true}')
 
-    def test_udp_justfloat_payload(self):
-        payload = struct.pack("<BBHIff", 2, 0, 0, 3, 1.25, -2.5)
-        packet = b"MT" + bytes([1, STREAM_JUSTFLOAT]) + struct.pack("<IQHBB", 9, 1234, len(payload), 0, 0) + payload
+    def test_udp_selected_values_payload(self):
+        payload = struct.pack("<BBHff", 2, 0, 0, 1.25, -2.5)
+        packet = b"MT" + bytes([2, STREAM_SELECTED_VALUES]) + struct.pack("<IQHBB", 9, 1234, len(payload), 0, 0) + payload
         decoded = decode_udp_packet(packet)
-        parsed = parse_justfloat_payload(decoded["payload"])
-        self.assertEqual(parsed["dropped"], 3)
-        self.assertAlmostEqual(parsed["values"][0], 1.25)
-        self.assertAlmostEqual(parsed["values"][1], -2.5)
+        parsed = parse_selected_values(decoded["payload"])
+        self.assertAlmostEqual(parsed[0], 1.25)
+        self.assertAlmostEqual(parsed[1], -2.5)
 
-    def test_batched_adc_payload(self):
-        payload = struct.pack("<IIHHIHHIHH", 10, 2000, 2, 1, 22000, 2000, 1234, 22100, 2010, 1235)
-        parsed = parse_adc_batch_payload(payload)
-        self.assertEqual(parsed["samples"][0]["sample"], 10)
-        self.assertEqual(parsed["samples"][1]["battery_mv"], 22100)
-        self.assertEqual(parsed["dropped"], 1)
-
-    def test_batched_justfloat_payload(self):
-        payload = struct.pack("<HHQBBHff", 1, 0, 1234, 2, 0, 0, 1.0, -1.0)
-        parsed = parse_justfloat_payload(payload)
-        self.assertEqual(len(parsed["frames"]), 1)
-        self.assertEqual(parsed["frames"][0]["values"][0], 1.0)
-
-    def test_batched_rm_motor_payload(self):
+    def test_can_last_payload_and_dji_parser(self):
         payload = bytearray(28)
         struct.pack_into("<HH", payload, 0, 1, 0)
-        struct.pack_into("<QBBBBHhhhI", payload, 4, 1000, 1, 55, 0, 0, 123, -100, 42, -9, 0)
-        parsed = parse_rm_motor_payload(bytes(payload))
-        self.assertEqual(parsed["motors"][0]["motor_id"], 1)
-        self.assertEqual(parsed["motors"][0]["rpm"], -100)
+        data = bytes([0x12, 0x34, 0xFF, 0x9C, 0x00, 0x2A, 55, 1])
+        struct.pack_into("<IBBBQ", payload, 4, 0x201, 8, 0, 0, 1234)
+        payload[20:28] = data
+        frames = parse_can_last(bytes(payload))
+        self.assertEqual(frames[0].can_id, 0x201)
+        parsed = parse_dji_motor(frames[0].can_id, frames[0].data)
+        self.assertEqual(parsed["angle"], 0x1234)
+        self.assertEqual(parsed["rpm"], -100)
+        self.assertEqual(parsed["temperature"], 55)
+
+    def test_vofa_justfloat_encoder(self):
+        data = encode_justfloat([1.0, -2.0])
+        self.assertEqual(data[-4:], b"\x00\x00\x80\x7f")
+        self.assertEqual(struct.unpack_from("<ff", data), (1.0, -2.0))
+
+    def test_project_json_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.mamba.json"
+            save_project(path, {"firmware_channels": ["adc.raw"], "vofa_channels": [{"index": 5, "source": "adc.raw"}]})
+            loaded = load_project(path)
+            self.assertEqual(loaded["firmware_channels"], ["adc.raw"])
+            self.assertEqual(loaded["vofa_channels"][0]["index"], 5)
 
 
 class AudioTests(unittest.TestCase):

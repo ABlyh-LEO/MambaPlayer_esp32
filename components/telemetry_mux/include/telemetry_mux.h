@@ -9,15 +9,14 @@
 extern "C" {
 #endif
 
-#define MAMBA_STREAM_BATTERY 1
-#define MAMBA_STREAM_CAN_RAW 2
-#define MAMBA_STREAM_RM_MOTOR 3
-#define MAMBA_STREAM_JUSTFLOAT 4
-#define MAMBA_STREAM_ALARM 5
-#define MAMBA_STREAM_ADC_BATCH 6
+#define MAMBA_STREAM_CATALOG 1
+#define MAMBA_STREAM_SELECTED_VALUES 2
+#define MAMBA_STREAM_CAN_LAST 3
 
 #define MAMBA_TELEM_CAN_MAX_DATA 8
 #define MAMBA_TELEM_JUSTFLOAT_MAX 16
+#define MAMBA_SELECTED_MAX_CHANNELS 16
+#define MAMBA_CAN_FORWARD_MAX_IDS 16
 
 typedef struct {
     uint32_t sample_index;
@@ -56,6 +55,7 @@ esp_err_t telemetry_mux_init(void);
 
 bool telemetry_mux_publish_adc(const telemetry_adc_sample_t *sample);
 bool telemetry_mux_receive_adc(telemetry_adc_sample_t *sample, uint32_t timeout_ms);
+bool telemetry_mux_get_latest_adc(telemetry_adc_sample_t *sample);
 
 bool telemetry_mux_publish_can(const telemetry_can_frame_t *frame);
 bool telemetry_mux_receive_can(telemetry_can_frame_t *frame, uint32_t timeout_ms);
@@ -65,6 +65,7 @@ bool telemetry_mux_receive_rm_motor(telemetry_rm_motor_t *motor, uint32_t timeou
 
 bool telemetry_mux_publish_justfloat(const telemetry_justfloat_frame_t *frame);
 bool telemetry_mux_receive_justfloat(telemetry_justfloat_frame_t *frame, uint32_t timeout_ms);
+bool telemetry_mux_get_latest_justfloat(telemetry_justfloat_frame_t *frame);
 
 uint32_t telemetry_mux_dropped_adc(void);
 uint32_t telemetry_mux_dropped_can(void);
