@@ -78,6 +78,7 @@ static volatile uint32_t s_usb_rx_frames;
 static volatile uint32_t s_usb_rx_loops;
 static volatile uint32_t s_usb_rx_empty;
 static volatile bool s_upload_active;
+static volatile bool s_audio_stream_active;
 
 static int ensure_udp_socket(void)
 {
@@ -300,6 +301,22 @@ static void send_error(uint16_t seq, const char *text)
 {
     send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
     send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
+}
+
+static void drain_realtime_telemetry(void)
+{
+    telemetry_adc_sample_t adc;
+    telemetry_can_frame_t can;
+    telemetry_rm_motor_t motor;
+    telemetry_justfloat_frame_t justfloat;
+    while (telemetry_mux_receive_adc(&adc, 0)) {
+    }
+    while (telemetry_mux_receive_can(&can, 0)) {
+    }
+    while (telemetry_mux_receive_rm_motor(&motor, 0)) {
+    }
+    while (telemetry_mux_receive_justfloat(&justfloat, 0)) {
+    }
 }
 
 static void send_udp_payload(uint8_t stream_id, const void *payload, size_t len)
@@ -577,6 +594,7 @@ static void handle_audio_test(const link_rx_frame_t *frame)
     if (bytes_contains(frame->payload, frame->len, "stop")) {
         audio_stop_and_save_offset();
         audio_stream_stop();
+        s_audio_stream_active = false;
     } else if (bytes_contains(frame->payload, frame->len, "tone30")) {
         audio_play_tone(30000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "tone")) {
@@ -596,10 +614,12 @@ static void handle_audio_stream_start(const link_rx_frame_t *frame)
     body[frame->len] = 0;
     uint32_t rate = MAMBA_AUDIO_SAMPLE_RATE_HZ;
     json_get_u32(body, "sample_rate", &rate);
+    s_audio_stream_active = true;
     esp_err_t err = audio_stream_start(rate);
     if (err == ESP_OK) {
         send_ack(frame->seq, "audio stream start");
     } else {
+        s_audio_stream_active = false;
         char text[64];
         snprintf(text, sizeof(text), "audio stream start failed: %s", esp_err_to_name(err));
         send_error(frame->seq, text);
@@ -620,8 +640,20 @@ static void handle_audio_stream_pcm(const link_rx_frame_t *frame)
 
 static void handle_audio_stream_stop(const link_rx_frame_t *frame)
 {
-    audio_stream_stop();
-    send_ack(frame->seq, "audio stream stop");
+    esp_err_t err = audio_stream_stop();
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        s_audio_stream_active = false;
+        alarm_status_t alarm = {0};
+        alarm_get_status(&alarm);
+        if (alarm.active) {
+            audio_play_alarm(s_config.alarm_file, audio_get_alarm_offset());
+        }
+        send_ack(frame->seq, "audio stream stop");
+    } else {
+        char text[64];
+        snprintf(text, sizeof(text), "audio stream stop failed: %s", esp_err_to_name(err));
+        send_error(frame->seq, text);
+    }
 }
 
 static void handle_frame(const link_rx_frame_t *frame)
@@ -696,8 +728,15 @@ static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len, 
                         .len = payload_len,
                     };
                     memcpy(frame.payload, parser->buffer + LINK_HEADER_LEN, payload_len);
-                    if (xQueueSend(s_rx_queue, &frame, 0) == pdTRUE && from_usb) {
-                        s_usb_rx_frames++;
+                    if (frame.type == MAMBA_LINK_TYPE_AUDIO_STREAM_PCM) {
+                        handle_audio_stream_pcm(&frame);
+                        if (from_usb) {
+                            s_usb_rx_frames++;
+                        }
+                    } else {
+                        if (xQueueSend(s_rx_queue, &frame, 0) == pdTRUE && from_usb) {
+                            s_usb_rx_frames++;
+                        }
                     }
                 }
                 parser->len = 0;
@@ -916,15 +955,20 @@ static void telemetry_task(void *arg)
 {
     uint32_t tick = 0;
     while (true) {
+        uint32_t interval_ms = s_config.telemetry_interval_ms;
+        if (interval_ms < 2 || interval_ms > 2000) {
+            interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
+        }
+        if (s_audio_stream_active) {
+            drain_realtime_telemetry();
+            vTaskDelay(pdMS_TO_TICKS(interval_ms));
+            continue;
+        }
         publish_adc_batch();
         publish_can_batch();
         publish_rm_batch();
         publish_justfloat_batch();
         publish_low_rate_status(tick++);
-        uint32_t interval_ms = s_config.telemetry_interval_ms;
-        if (interval_ms < 2 || interval_ms > 2000) {
-            interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
-        }
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
     }
 }

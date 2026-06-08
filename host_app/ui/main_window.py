@@ -206,6 +206,7 @@ class UdpListener(QtCore.QThread):
 class SpeakerCapture(QtCore.QThread):
     pcm_ready = QtCore.Signal(bytes)
     state = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
 
     def __init__(self, target_rate: int = 16000) -> None:
         super().__init__()
@@ -216,39 +217,37 @@ class SpeakerCapture(QtCore.QThread):
         try:
             self._run_wasapi()
         except Exception as exc:
-            self.state.emit(f"WASAPI unavailable, using mock: {exc}")
-            self._run_mock()
+            self.failed.emit(f"WASAPI loopback failed: {exc}")
 
     def _run_wasapi(self) -> None:
         import sounddevice as sd
 
-        device = sd.query_devices(kind="output")
+        output_index = sd.default.device[1]
+        if output_index is None or output_index < 0:
+            raise RuntimeError("no default output device")
+        device = sd.query_devices(output_index)
         source_rate = int(device.get("default_samplerate") or 48000)
         channels = int(device.get("max_output_channels") or 2)
+        if channels <= 0:
+            raise RuntimeError("default output device has no output channels")
         extra = sd.WasapiSettings(loopback=True)
-        self.state.emit(f"WASAPI loopback {source_rate}Hz {channels}ch")
+        self.state.emit(f"WASAPI loopback {device.get('name', output_index)} {source_rate}Hz {channels}ch")
 
         def callback(indata, frames, time_info, status):
             if not self._running:
                 raise sd.CallbackStop()
+            if status:
+                self.state.emit(str(status))
             mono = np.asarray(indata, dtype=np.float32).mean(axis=1)
             pcm = self._to_pcm16(mono, source_rate)
             self.pcm_ready.emit(pcm.tobytes())
 
-        with sd.InputStream(samplerate=source_rate, channels=channels, dtype="float32",
+        blocksize = max(128, source_rate // 50)
+        with sd.InputStream(device=output_index, samplerate=source_rate, channels=channels,
+                            dtype="float32", blocksize=blocksize,
                             extra_settings=extra, callback=callback):
             while self._running:
                 self.msleep(50)
-
-    def _run_mock(self) -> None:
-        phase = 0
-        chunk = 320
-        while self._running:
-            t = (np.arange(chunk, dtype=np.float32) + phase) / float(self.target_rate)
-            phase += chunk
-            wave = np.sin(2 * math.pi * 440 * t).astype(np.float32) * 0.2
-            self.pcm_ready.emit(np.round(wave * 32767).astype("<i2").tobytes())
-            self.msleep(20)
 
     def _to_pcm16(self, mono: np.ndarray, source_rate: int) -> np.ndarray:
         if source_rate != self.target_rate and len(mono) > 0:
@@ -565,8 +564,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.properties.speaker_button.setChecked(False)
                 return
             self.speaker_worker = SpeakerCapture()
-            self.speaker_worker.pcm_ready.connect(self._send_speaker_pcm)
+            self.speaker_worker.pcm_ready.connect(self._send_speaker_pcm, QtCore.Qt.DirectConnection)
             self.speaker_worker.state.connect(self._log)
+            self.speaker_worker.failed.connect(self._speaker_failed)
             self.speaker_worker.start()
             self._log("speaker mode started")
         else:
@@ -580,6 +580,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as exc:
                     self._log(f"speaker stop failed: {exc}")
             self._log("speaker mode stopped")
+
+    def _speaker_failed(self, message: str) -> None:
+        self._log(message)
+        QtWidgets.QMessageBox.warning(self, "Speaker Mode", message)
+        self.properties.speaker_button.setChecked(False)
 
     def _send_speaker_pcm(self, payload: bytes) -> None:
         transport = self._active_transport()
