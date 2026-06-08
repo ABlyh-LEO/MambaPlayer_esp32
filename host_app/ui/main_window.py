@@ -222,16 +222,12 @@ class SpeakerCapture(QtCore.QThread):
     def _run_wasapi(self) -> None:
         import sounddevice as sd
 
-        output_index = sd.default.device[1]
-        if output_index is None or output_index < 0:
-            raise RuntimeError("no default output device")
-        device = sd.query_devices(output_index)
+        device_index, device = self._select_loopback_input(sd)
         source_rate = int(device.get("default_samplerate") or 48000)
-        channels = int(device.get("max_output_channels") or 2)
+        channels = min(2, int(device.get("max_input_channels") or 0))
         if channels <= 0:
-            raise RuntimeError("default output device has no output channels")
-        extra = sd.WasapiSettings(loopback=True)
-        self.state.emit(f"WASAPI loopback {device.get('name', output_index)} {source_rate}Hz {channels}ch")
+            raise RuntimeError("selected loopback device has no input channels")
+        self.state.emit(f"audio capture {device.get('name', device_index)} {source_rate}Hz {channels}ch")
 
         def callback(indata, frames, time_info, status):
             if not self._running:
@@ -243,11 +239,34 @@ class SpeakerCapture(QtCore.QThread):
             self.pcm_ready.emit(pcm.tobytes())
 
         blocksize = max(128, source_rate // 50)
-        with sd.InputStream(device=output_index, samplerate=source_rate, channels=channels,
-                            dtype="float32", blocksize=blocksize,
-                            extra_settings=extra, callback=callback):
+        with sd.InputStream(device=device_index, samplerate=source_rate, channels=channels,
+                            dtype="float32", blocksize=blocksize, callback=callback):
             while self._running:
                 self.msleep(50)
+
+    def _select_loopback_input(self, sd):
+        devices = sd.query_devices()
+        preferred_terms = (
+            "loopback",
+            "stereo mix",
+            "立体声混音",
+            "what u hear",
+            "output with hap",
+        )
+        usable = []
+        for index, device in enumerate(devices):
+            if int(device.get("max_input_channels") or 0) <= 0:
+                continue
+            name = str(device.get("name", ""))
+            lower = name.lower()
+            if any(term in lower or term in name for term in preferred_terms):
+                usable.append((index, device))
+        if usable:
+            return usable[0]
+        raise RuntimeError(
+            "no system-audio capture device found. Enable Windows Stereo Mix, "
+            "install a loopback-capable audio backend, or select a device exposed as loopback."
+        )
 
     def _to_pcm16(self, mono: np.ndarray, source_rate: int) -> np.ndarray:
         if source_rate != self.target_rate and len(mono) > 0:
