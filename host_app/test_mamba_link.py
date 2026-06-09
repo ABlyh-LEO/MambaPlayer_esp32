@@ -16,7 +16,7 @@ from .mamba_link import (
     decode_udp_packet,
     encode_frame,
 )
-from .router import encode_justfloat, parse_can_last, parse_dji_motor, parse_selected_values, save_project, load_project
+from .router import encode_justfloat, parse_can_last, parse_dji_motor, parse_selected_batch, parse_selected_values, save_project, load_project
 
 
 class ProtocolTests(unittest.TestCase):
@@ -39,6 +39,14 @@ class ProtocolTests(unittest.TestCase):
         parsed = parse_selected_values(decoded["payload"])
         self.assertAlmostEqual(parsed[0], 1.25)
         self.assertAlmostEqual(parsed[1], -2.5)
+
+    def test_udp_selected_values_batch_payload(self):
+        payload = struct.pack("<BBHffff", 2, 2, 1000, 1.0, 2.0, 3.0, 4.0)
+        batch = parse_selected_batch(payload)
+        self.assertEqual(len(batch), 2)
+        self.assertEqual(batch[0], [1.0, 2.0])
+        self.assertEqual(batch[1], [3.0, 4.0])
+        self.assertEqual(parse_selected_values(payload), [3.0, 4.0])
 
     def test_can_last_payload_and_dji_parser(self):
         payload = bytearray(28)

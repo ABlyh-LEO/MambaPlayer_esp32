@@ -1,4 +1,5 @@
 import os
+import struct
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -108,6 +109,37 @@ class HostGuiSmokeTests(unittest.TestCase):
             self.app.processEvents()
             self.assertEqual(window.sources["adc.battery_mv"].value, 22000)
             self.assertEqual(window.sources["i2c.capacity"].value, 42)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_selected_batch_enqueues_1khz_vofa_frames(self):
+        class FakeForwarder:
+            def __init__(self):
+                self.items = []
+
+            def enqueue(self, host, remote_port, local_port, values):
+                self.items.append(values)
+
+            def stop(self):
+                pass
+
+            def wait(self, _ms):
+                pass
+
+        window = MainWindow(start_workers=False)
+        fake = FakeForwarder()
+        window.vofa_forwarder = fake
+        try:
+            window.firmware_channels = ["adc.raw", "adc.battery_mv"]
+            window.vofa_channels = [
+                {"index": 0, "source": "adc.raw", "enabled": True},
+                {"index": 1, "source": "adc.battery_mv", "enabled": True},
+            ]
+            payload = struct.pack("<BBHffffffff", 2, 4, 1000, 1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0)
+            window._handle_selected(payload)
+            self.assertEqual(fake.items, [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]])
+            self.assertEqual(window.selected_values["adc.raw"], 4.0)
         finally:
             window.close()
             self.app.processEvents()

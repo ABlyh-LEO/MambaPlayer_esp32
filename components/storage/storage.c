@@ -48,7 +48,7 @@ esp_err_t storage_load_config(mamba_config_t *config)
     }
     nvs_get_u32(nvs, "can_bitrate", &config->can_bitrate);
     nvs_get_u32(nvs, "tel_ms", &config->telemetry_interval_ms);
-    if (config->telemetry_interval_ms < 1 || config->telemetry_interval_ms > 10) {
+    if (config->telemetry_interval_ms != MAMBA_TELEMETRY_BATCH_INTERVAL_MS) {
         config->telemetry_interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
     }
     nvs_get_u32(nvs, "v_enter", &config->low_voltage_enter_mv);

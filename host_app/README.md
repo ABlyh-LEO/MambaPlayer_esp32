@@ -33,7 +33,9 @@ fallback path and is still used for first-time Wi-Fi configuration.
   1 kHz table, then apply the stream configuration. These are the only values
   sampled into the firmware-side selected-values UDP stream.
 - Select any source key and add it to the VOFA table. The host sends enabled
-  VOFA rows at 1 kHz as JustFloat UDP frames.
+  VOFA rows at 1 kHz as JustFloat UDP frames. The firmware may batch several
+  1 kHz samples into one UDP packet for efficiency; the host expands the batch
+  back into individual 1 kHz JustFloat frames before forwarding to VOFA+.
 - VOFA+ defaults: the host sends to `127.0.0.1:1347` and binds local UDP port
   `1346`. Configure VOFA+ to receive JustFloat over UDP on port `1347`.
 - Project settings are saved as `host_app\runtime\last_project.mamba.json`.

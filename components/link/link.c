@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
@@ -27,6 +28,8 @@
 
 #define LINK_HEADER_LEN 12
 #define LINK_UDP_MAX 1200
+#define SELECTED_BATCH_SAMPLES 4
+#define SELECTED_BATCH_INTERVAL_US 1000
 
 typedef enum {
     LINK_TX_USB,
@@ -74,9 +77,16 @@ typedef struct {
     char key[32];
 } selected_channel_t;
 
+typedef struct {
+    size_t len;
+    uint8_t payload[4 + SELECTED_BATCH_SAMPLES * MAMBA_SELECTED_MAX_CHANNELS * sizeof(float)];
+} selected_packet_t;
+
 static const char *TAG = "link";
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_tx_lock;
+static SemaphoreHandle_t s_selected_lock;
+static QueueHandle_t s_selected_tx_queue;
 static mamba_config_t s_config;
 static mamba_link_config_updated_cb_t s_config_cb;
 static int s_tcp_sock = -1;
@@ -92,6 +102,9 @@ static volatile int s_udp_last_errno;
 static volatile uint8_t s_udp_last_stream;
 static volatile uint32_t s_telemetry_ticks;
 static volatile uint32_t s_catalog_count;
+static volatile uint32_t s_selected_sample_count;
+static volatile uint32_t s_selected_packet_count;
+static volatile uint32_t s_selected_drop_count;
 static audio_upload_t s_upload;
 static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
 static volatile uint32_t s_usb_rx_bytes;
@@ -102,6 +115,8 @@ static volatile bool s_upload_active;
 static volatile bool s_audio_stream_active;
 static selected_channel_t s_selected[MAMBA_SELECTED_MAX_CHANNELS];
 static uint8_t s_selected_count;
+static float s_selected_batch[SELECTED_BATCH_SAMPLES][MAMBA_SELECTED_MAX_CHANNELS];
+static uint8_t s_selected_batch_count;
 
 static int ensure_udp_socket(void)
 {
@@ -491,7 +506,8 @@ static void send_status(uint16_t seq)
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
         "\"forward_filter\":\"%s\",\"parser\":\"host\"},"
         "\"link\":{\"udp_tel\":%u,\"udp_sent\":%lu,\"udp_errors\":%lu,\"udp_errno\":%d,\"udp_stream\":%u,"
-        "\"tel_ticks\":%lu,\"catalogs\":%lu,\"stream_active\":%s},"
+        "\"tel_ticks\":%lu,\"catalogs\":%lu,\"sel_samples\":%lu,\"sel_packets\":%lu,\"sel_drops\":%lu,"
+        "\"stream_active\":%s},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
         "\"wifi\":{\"ssid\":\"%s\",\"tcp_port\":%u,\"udp_hello\":%u,\"udp_telemetry\":%u}}",
         MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_config.device_name,
@@ -509,6 +525,8 @@ static void send_status(uint16_t seq)
         s_udp_tel_port, (unsigned long)s_udp_send_count, (unsigned long)s_udp_send_errors,
         s_udp_last_errno, s_udp_last_stream,
         (unsigned long)s_telemetry_ticks, (unsigned long)s_catalog_count,
+        (unsigned long)s_selected_sample_count, (unsigned long)s_selected_packet_count,
+        (unsigned long)s_selected_drop_count,
         s_audio_stream_active ? "true" : "false",
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
@@ -782,8 +800,12 @@ static void handle_set_stream_channels(const link_rx_frame_t *frame)
             count++;
         }
     }
-    memcpy(s_selected, next, sizeof(s_selected));
-    s_selected_count = count;
+    if (xSemaphoreTake(s_selected_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(s_selected, next, sizeof(s_selected));
+        s_selected_count = count;
+        s_selected_batch_count = 0;
+        xSemaphoreGive(s_selected_lock);
+    }
     send_ack(frame->seq, "stream channels updated");
 }
 
@@ -998,8 +1020,15 @@ static float selected_value(const selected_channel_t *channel, const battery_sna
 
 static void publish_selected_values(void)
 {
-    uint8_t count = s_selected_count;
+    selected_channel_t selected[MAMBA_SELECTED_MAX_CHANNELS];
+    uint8_t count = 0;
+    if (xSemaphoreTake(s_selected_lock, pdMS_TO_TICKS(1)) == pdTRUE) {
+        count = s_selected_count;
+        memcpy(selected, s_selected, sizeof(selected));
+        xSemaphoreGive(s_selected_lock);
+    }
     if (count == 0) {
+        s_selected_batch_count = 0;
         return;
     }
     battery_snapshot_t bat;
@@ -1008,14 +1037,65 @@ static void publish_selected_values(void)
     battery_get_snapshot(&bat);
     bool has_adc = telemetry_mux_get_latest_adc(&adc);
     bool has_jf = telemetry_mux_get_latest_justfloat(&jf);
-    uint8_t payload[4 + MAMBA_SELECTED_MAX_CHANNELS * sizeof(float)];
-    payload[0] = count;
-    payload[1] = 0;
-    put16(payload + 2, 0);
-    for (uint8_t i = 0; i < count; ++i) {
-        put_float(payload + 4 + i * sizeof(float), selected_value(&s_selected[i], &bat, &adc, has_adc, &jf, has_jf));
+    if (s_selected_batch_count >= SELECTED_BATCH_SAMPLES) {
+        s_selected_batch_count = 0;
     }
-    send_udp_payload(MAMBA_STREAM_SELECTED_VALUES, payload, 4 + count * sizeof(float));
+    for (uint8_t i = 0; i < count; ++i) {
+        s_selected_batch[s_selected_batch_count][i] =
+            selected_value(&selected[i], &bat, &adc, has_adc, &jf, has_jf);
+    }
+    s_selected_sample_count++;
+    s_selected_batch_count++;
+    if (s_selected_batch_count < SELECTED_BATCH_SAMPLES) {
+        return;
+    }
+
+    selected_packet_t packet = {0};
+    packet.payload[0] = count;
+    packet.payload[1] = SELECTED_BATCH_SAMPLES;
+    put16(packet.payload + 2, SELECTED_BATCH_INTERVAL_US);
+    size_t offset = 4;
+    for (uint8_t sample = 0; sample < SELECTED_BATCH_SAMPLES; ++sample) {
+        for (uint8_t i = 0; i < count; ++i) {
+            put_float(packet.payload + offset, s_selected_batch[sample][i]);
+            offset += sizeof(float);
+        }
+    }
+    packet.len = offset;
+    if (s_selected_tx_queue && xQueueSend(s_selected_tx_queue, &packet, 0) != pdTRUE) {
+        selected_packet_t old_packet;
+        if (xQueueReceive(s_selected_tx_queue, &old_packet, 0) == pdTRUE) {
+            s_selected_drop_count++;
+        }
+        if (xQueueSend(s_selected_tx_queue, &packet, 0) != pdTRUE) {
+            s_selected_drop_count++;
+        }
+    }
+    s_selected_packet_count++;
+    s_selected_batch_count = 0;
+}
+
+static void selected_sample_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    while (true) {
+        if (!s_audio_stream_active) {
+            publish_selected_values();
+        } else {
+            s_selected_batch_count = 0;
+        }
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(1));
+    }
+}
+
+static void selected_tx_task(void *arg)
+{
+    selected_packet_t packet;
+    while (true) {
+        if (xQueueReceive(s_selected_tx_queue, &packet, portMAX_DELAY) == pdTRUE) {
+            send_udp_payload(MAMBA_STREAM_SELECTED_VALUES, packet.payload, packet.len);
+        }
+    }
 }
 
 static void publish_can_last(void)
@@ -1113,7 +1193,6 @@ static void telemetry_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(interval_ms));
             continue;
         }
-        publish_selected_values();
         publish_can_last();
         publish_catalog(tick++);
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
@@ -1187,7 +1266,9 @@ esp_err_t link_init(const mamba_config_t *config)
     }
     s_lock = xSemaphoreCreateMutex();
     s_tx_lock = xSemaphoreCreateMutex();
-    ESP_RETURN_ON_FALSE(s_lock && s_tx_lock, ESP_ERR_NO_MEM, TAG, "alloc");
+    s_selected_lock = xSemaphoreCreateMutex();
+    s_selected_tx_queue = xQueueCreate(16, sizeof(selected_packet_t));
+    ESP_RETURN_ON_FALSE(s_lock && s_tx_lock && s_selected_lock && s_selected_tx_queue, ESP_ERR_NO_MEM, TAG, "alloc");
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_cfg.rx_buffer_size = 512;
     usb_cfg.tx_buffer_size = 512;
@@ -1199,6 +1280,8 @@ esp_err_t link_init(const mamba_config_t *config)
     ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 6144, NULL, 5, NULL);
     ok &= xTaskCreate(hello_task, "link_hello", 3072, NULL, 3, NULL);
     ok &= xTaskCreate(telemetry_task, "link_tel", 4096, NULL, 6, NULL);
+    ok &= xTaskCreate(selected_sample_task, "link_sel_s", 4096, NULL, 10, NULL);
+    ok &= xTaskCreate(selected_tx_task, "link_sel_tx", 4096, NULL, 7, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "tasks");
     ESP_LOGI(TAG, "MambaLink v%u ready, self-test=%s", MAMBA_PROTOCOL_VERSION, link_self_test() ? "ok" : "fail");
     return ESP_OK;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import socket
 import threading
 import time
@@ -49,7 +50,7 @@ from ..router import (
     parse_can_last,
     parse_catalog,
     parse_dji_motor,
-    parse_selected_values,
+    parse_selected_batch,
     save_project,
 )
 
@@ -176,6 +177,7 @@ class TcpServer(QtCore.QThread):
 
 class UdpListener(QtCore.QThread):
     telemetry = QtCore.Signal(dict)
+    selected_batch = QtCore.Signal(list)
     hello = QtCore.Signal(str)
     warning = QtCore.Signal(str)
 
@@ -202,6 +204,12 @@ class UdpListener(QtCore.QThread):
                 try:
                     item = decode_udp_packet(data)
                     item["addr"] = addr[0]
+                    if item["stream_id"] == STREAM_SELECTED_VALUES:
+                        try:
+                            self.selected_batch.emit(parse_selected_batch(item["payload"]))
+                            continue
+                        except ValueError:
+                            pass
                     self.telemetry.emit(item)
                 except ValueError as exc:
                     if data[:2] == b"MT" and len(data) >= 3:
@@ -415,6 +423,66 @@ class SpeakerCapture(QtCore.QThread):
         self._running = False
 
 
+class VofaForwarder(QtCore.QThread):
+    warning = QtCore.Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: queue.Queue[tuple[str, int, int, list[float]]] = queue.Queue(maxsize=4096)
+        self._running = True
+        self._sender = VofaUdpSender()
+
+    def enqueue(self, host: str, remote_port: int, local_port: int, values: list[float]) -> None:
+        item = (host, int(remote_port), int(local_port), list(values))
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def run(self) -> None:
+        timer_period_set = False
+        try:
+            import ctypes
+            timer_period_set = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+        except Exception:
+            timer_period_set = False
+        next_send = time.perf_counter()
+        try:
+            while self._running:
+                try:
+                    host, remote_port, local_port, values = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    next_send = time.perf_counter()
+                    continue
+                now = time.perf_counter()
+                if now < next_send:
+                    time.sleep(next_send - now)
+                elif now - next_send > 0.02:
+                    next_send = now
+                try:
+                    self._sender.configure(local_port)
+                    self._sender.send(host, remote_port, values)
+                except OSError as exc:
+                    self.warning.emit(f"VOFA UDP failed: {exc}")
+                next_send += 0.001
+        finally:
+            if timer_period_set:
+                try:
+                    import ctypes
+                    ctypes.windll.winmm.timeEndPeriod(1)
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        self._running = False
+        self._sender.close()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, start_workers: bool = True) -> None:
         super().__init__()
@@ -434,20 +502,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_worker: SerialWorker | None = None
         self.audio_upload_worker: AudioUploadWorker | None = None
         self.speaker_worker: SpeakerCapture | None = None
-        self.vofa = VofaUdpSender()
+        self.vofa_forwarder = VofaForwarder()
         self.vofa_timer = QtCore.QTimer(self)
+        self.vofa_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.vofa_timer.timeout.connect(self._send_vofa_frame)
         self.mock_timer = QtCore.QTimer(self)
         self.mock_timer.timeout.connect(self._mock_tick)
         self.status_poll_timer = QtCore.QTimer(self)
         self.status_poll_timer.timeout.connect(self._poll_status_until_sources)
         self._mock_phase = 0.0
+        self._last_selected_ui_refresh = 0.0
         self._shutdown_done = False
         self._build_ui()
         self._wire()
         self._load_project_to_ui()
         self.vofa_timer.start(1)
         if start_workers:
+            self.vofa_forwarder.start()
             self.tcp.start()
             self.udp_hello.start()
             self.udp_tel.start()
@@ -566,8 +637,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tcp.frame_received.connect(self._handle_frame)
         self.tcp.client_changed.connect(self._tcp_changed)
         self.tcp.protocol_warning.connect(self._log)
+        self.vofa_forwarder.warning.connect(self._log)
         self.udp_hello.hello.connect(self._hello_changed)
         self.udp_tel.telemetry.connect(self._handle_telemetry)
+        self.udp_tel.selected_batch.connect(self._handle_selected_batch)
         self.udp_tel.warning.connect(self._log)
         self.theme_button.clicked.connect(self._toggle_theme)
         self.mock_button.toggled.connect(self._toggle_mock)
@@ -699,15 +772,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _handle_selected(self, payload: bytes) -> None:
         try:
-            values = parse_selected_values(payload)
+            batch = parse_selected_batch(payload)
         except ValueError:
             return
+        self._handle_selected_batch(batch)
+
+    def _handle_selected_batch(self, batch: list) -> None:
+        if not batch:
+            return
         now = time.monotonic()
-        for key, value in zip(self.firmware_channels, values):
+        for values in batch:
+            sample = {key: float(value) for key, value in zip(self.firmware_channels, values)}
+            self._enqueue_vofa_sample(sample)
+        latest = batch[-1]
+        for key, value in zip(self.firmware_channels, latest):
             self.sources[key] = SourceValue(key=key, name=key, value=float(value), rate_hz=1000, updated_at=now)
             self.selected_values[key] = float(value)
-        self._refresh_firmware_table()
-        self._refresh_channels_table()
+        if now - self._last_selected_ui_refresh >= 0.1:
+            self._last_selected_ui_refresh = now
+            self._refresh_firmware_table()
+            self._refresh_channels_table()
 
     def _handle_can(self, payload: bytes) -> None:
         try:
@@ -858,17 +942,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log(f"CAN apply failed: {exc}")
 
     def _send_vofa_frame(self) -> None:
+        if self.selected_values:
+            return
+        self._enqueue_vofa_sample({})
+
+    def _enqueue_vofa_sample(self, overrides: dict[str, float]) -> None:
         values: list[float] = []
         for mapping in sorted(self.vofa_channels, key=lambda item: int(item.get("index", 0))):
             if not mapping.get("enabled", True):
                 continue
             source = str(mapping.get("source", ""))
-            values.append(float(self.sources.get(source, SourceValue(source, source)).value))
-        try:
-            self.vofa.configure(self.vofa_local.value())
-            self.vofa.send(self.vofa_host.text().strip() or "127.0.0.1", self.vofa_remote.value(), values)
-        except OSError as exc:
-            self._log(f"VOFA UDP failed: {exc}")
+            values.append(float(overrides.get(source, self.sources.get(source, SourceValue(source, source)).value)))
+        if not values:
+            return
+        self.vofa_forwarder.enqueue(
+            self.vofa_host.text().strip() or "127.0.0.1",
+            self.vofa_remote.value(),
+            self.vofa_local.value(),
+            values,
+        )
 
     def _sync_vofa_table_edits(self) -> None:
         rows = self.channels_table.rowCount()
@@ -1063,8 +1155,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._shutdown_done = True
         self._save_project()
-        self.vofa.close()
-        for worker in (self.speaker_worker, self.serial_worker, self.tcp, self.udp_hello, self.udp_tel):
+        for worker in (self.speaker_worker, self.serial_worker, self.tcp, self.udp_hello, self.udp_tel, self.vofa_forwarder):
             if worker:
                 self._stop_worker(worker)
 

@@ -93,14 +93,34 @@ def parse_catalog(payload: bytes) -> list[SourceValue]:
 
 
 def parse_selected_values(payload: bytes) -> list[float]:
+    batch = parse_selected_batch(payload)
+    return batch[-1] if batch else []
+
+
+def parse_selected_batch(payload: bytes) -> list[list[float]]:
     if len(payload) < 4:
         raise ValueError("selected-values payload too short")
     count = payload[0]
-    if count > 16 or len(payload) < 4 + count * 4:
+    sample_count = payload[1]
+    if count > 16:
         raise ValueError("bad selected-values count")
     if count == 0:
         return []
-    return list(struct.unpack_from("<" + "f" * count, payload, 4))
+    if sample_count == 0:
+        if len(payload) < 4 + count * 4:
+            raise ValueError("bad selected-values count")
+        return [list(struct.unpack_from("<" + "f" * count, payload, 4))]
+    if sample_count > 32:
+        raise ValueError("bad selected-values sample count")
+    expected = 4 + sample_count * count * 4
+    if len(payload) < expected:
+        raise ValueError("bad selected-values batch size")
+    out: list[list[float]] = []
+    offset = 4
+    for _sample in range(sample_count):
+        out.append(list(struct.unpack_from("<" + "f" * count, payload, offset)))
+        offset += count * 4
+    return out
 
 
 def parse_can_last(payload: bytes) -> list[CanFrame]:
