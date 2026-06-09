@@ -1,5 +1,6 @@
 #include "wifi_client.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -160,9 +161,18 @@ static void tcp_client_task(void *arg)
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             ESP_LOGI(TAG, "connected to host " IPSTR ":%u", IP2STR(&ip.gw), tcp_port);
             link_attach_tcp_socket(sock, ip.gw.addr);
+            uint8_t rx_buf[256];
             while ((xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT) != 0 &&
                    link_is_tcp_socket_attached(sock)) {
-                vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+                int n = recv(sock, rx_buf, sizeof(rx_buf), 0);
+                if (n > 0) {
+                    link_handle_tcp_rx_data(rx_buf, (size_t)n);
+                } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    continue;
+                } else {
+                    break;
+                }
             }
             link_detach_tcp_socket(sock);
         } else {
@@ -220,7 +230,7 @@ esp_err_t wifi_client_init(const mamba_config_t *config)
     } else {
         ESP_LOGI(TAG, "wifi credentials empty; configure them over USB");
     }
-    BaseType_t ok = xTaskCreate(tcp_client_task, "wifi_tcp", 4096, NULL, 4, NULL);
+    BaseType_t ok = xTaskCreate(tcp_client_task, "wifi_tcp", 8192, NULL, 8, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "tcp task");
     return ESP_OK;
 }

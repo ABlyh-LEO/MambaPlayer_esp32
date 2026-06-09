@@ -354,7 +354,7 @@ static void play_file(const char *path, uint32_t offset, bool loop)
         mono_to_stereo(pcm, stereo, samples);
         size_t requested = samples * 2 * sizeof(stereo[0]);
         size_t written = 0;
-        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 1000);
+        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 50);
         note_i2s_write(requested, written, err);
         pos += info.block_align;
         if (loop) {
@@ -410,7 +410,7 @@ static void play_tone(uint32_t duration_ms, uint32_t frequency_hz)
         }
         size_t requested = frames * 2 * sizeof(stereo[0]);
         size_t written = 0;
-        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 1000);
+        esp_err_t err = i2s_channel_write(tx, stereo, requested, &written, 50);
         note_i2s_write(requested, written, err);
         pos += frames;
         set_status(true, "tone", pos, MAMBA_AUDIO_SAMPLE_RATE_HZ);
@@ -486,7 +486,7 @@ esp_err_t audio_stream_start(uint32_t sample_rate_hz)
         sample_rate_hz = MAMBA_AUDIO_SAMPLE_RATE_HZ;
     }
     request_playback_stop(true);
-    if (xSemaphoreTake(s_i2s_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+    if (xSemaphoreTake(s_i2s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
     if (s_stream_tx) {

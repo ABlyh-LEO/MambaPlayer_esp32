@@ -8,8 +8,8 @@ import numpy as np
 from PySide6 import QtWidgets
 
 from .telemetry.store import TelemetryStore
-from .mamba_link import TYPE_STATUS, TYPE_TELEMETRY
-from .ui.main_window import MainWindow
+from .mamba_link import TYPE_AUDIO_STREAM_START, TYPE_AUDIO_STREAM_STOP, TYPE_STATUS, TYPE_TELEMETRY
+from .ui.main_window import MainWindow, SpeakerControlWorker
 from .ui.theme import apply_light_theme
 
 
@@ -143,6 +143,21 @@ class HostGuiSmokeTests(unittest.TestCase):
         finally:
             window.close()
             self.app.processEvents()
+
+    def test_speaker_control_worker_start_sequence(self):
+        class RecordingTransport:
+            def __init__(self):
+                self.calls = []
+
+            def send_wait(self, msg_type, payload=b"", timeout=3.0):
+                self.calls.append((msg_type, payload, timeout))
+                return b"ok"
+
+        transport = RecordingTransport()
+        worker = SpeakerControlWorker(transport, "start", "192.168.4.2")
+        worker.run()
+        self.assertEqual([call[0] for call in transport.calls], [TYPE_AUDIO_STREAM_STOP, TYPE_AUDIO_STREAM_START])
+        self.assertEqual(transport.calls[-1][2], 8.0)
 
 
 if __name__ == "__main__":

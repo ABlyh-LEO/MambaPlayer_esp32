@@ -118,10 +118,14 @@ static volatile int s_speaker_udp_last_errno;
 static TaskHandle_t s_speaker_udp_task_handle;
 static audio_upload_t s_upload;
 static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
+static link_parser_t s_tcp_parser;
 static volatile uint32_t s_usb_rx_bytes;
 static volatile uint32_t s_usb_rx_frames;
 static volatile uint32_t s_usb_rx_loops;
 static volatile uint32_t s_usb_rx_empty;
+static volatile uint32_t s_tcp_rx_bytes;
+static volatile uint32_t s_tcp_rx_frames;
+static volatile uint32_t s_tcp_rx_errors;
 static volatile bool s_upload_active;
 static volatile bool s_audio_stream_active;
 static selected_channel_t s_selected[MAMBA_SELECTED_MAX_CHANNELS];
@@ -383,7 +387,7 @@ static void send_bytes_usb(const uint8_t *data, size_t len)
             if (chunk > 128) {
                 chunk = 128;
             }
-            int written = usb_serial_jtag_write_bytes(data + sent, chunk, pdMS_TO_TICKS(100));
+            int written = usb_serial_jtag_write_bytes(data + sent, chunk, pdMS_TO_TICKS(10));
             if (written <= 0) {
                 break;
             }
@@ -434,14 +438,14 @@ static void send_frame(link_tx_target_t target, uint8_t type, uint16_t seq, cons
 
 static void send_ack(uint16_t seq, const char *text)
 {
-    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_ACK, seq, text, strlen(text));
     send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_ACK, seq, text, strlen(text));
+    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_ACK, seq, text, strlen(text));
 }
 
 static void send_error(uint16_t seq, const char *text)
 {
-    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
     send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
+    send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
 }
 
 static void stop_speaker_stream(bool resume_alarm)
@@ -538,13 +542,12 @@ static void send_status(uint16_t seq)
         "{\"fw\":\"%s\",\"proto\":%u,\"device\":\"%s\","
         "\"battery\":{\"i2c\":%s,\"capacity\":%u,\"fused_mv\":%lu,\"adc_mv\":%lu,\"current_ma\":%ld,\"temp_decic\":%d},"
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
-        "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\","
-        "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu,"
-        "\"speaker_udp_packets\":%lu,\"speaker_udp_samples\":%lu,\"speaker_udp_drops\":%lu,\"speaker_udp_bad\":%lu,"
-        "\"speaker_udp_seq\":%lu,\"speaker_udp_errno\":%d,\"speaker_udp_port\":%u}},"
-        "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
-        "\"forward_filter\":\"%s\",\"parser\":\"host\"},"
+        "\"audio\":{\"playing\":%s,\"current\":\"%s\","
+        "\"diag\":{\"speaker_udp_packets\":%lu,\"speaker_udp_samples\":%lu,\"speaker_udp_drops\":%lu,"
+        "\"speaker_udp_bad\":%lu,\"speaker_udp_seq\":%lu,\"speaker_udp_errno\":%d,\"speaker_udp_port\":%u}},"
+        "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu},"
         "\"link\":{\"udp_tel\":%u,\"udp_sent\":%lu,\"udp_errors\":%lu,\"udp_errno\":%d,\"udp_stream\":%u,"
+        "\"usb_rx_bytes\":%lu,\"usb_rx_frames\":%lu,\"tcp_rx_bytes\":%lu,\"tcp_rx_frames\":%lu,\"tcp_rx_errors\":%lu,"
         "\"tel_ticks\":%lu,\"catalogs\":%lu,\"sel_samples\":%lu,\"sel_packets\":%lu,\"sel_drops\":%lu,"
         "\"stream_active\":%s},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
@@ -555,18 +558,18 @@ static void send_status(uint16_t seq)
         (long)bat.current_ma, bat.temperature_decic,
         alarm.active ? "true" : "false", (unsigned long)audio_get_alarm_offset(),
         (unsigned long)alarm.transitions,
-        audio.playing ? "true" : "false", s_config.alarm_file, s_config.power_on_file, audio.file,
-        (unsigned long)audio.i2s_starts, (unsigned long)audio.write_calls,
-        (unsigned long)audio.write_bytes, (unsigned long)audio.write_errors,
-        (unsigned long)audio.last_write_bytes,
+        audio.playing ? "true" : "false", audio.file,
         (unsigned long)s_speaker_udp_rx_packets, (unsigned long)s_speaker_udp_rx_samples,
         (unsigned long)s_speaker_udp_drop_count, (unsigned long)s_speaker_udp_bad_packets,
         (unsigned long)s_speaker_udp_last_seq, s_speaker_udp_last_errno,
         MAMBA_LINK_UDP_SPEAKER_PORT,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
-        (unsigned long)can.rx_count, (unsigned long)can.dropped_count, s_config.can_filter,
+        (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
         s_udp_tel_port, (unsigned long)s_udp_send_count, (unsigned long)s_udp_send_errors,
         s_udp_last_errno, s_udp_last_stream,
+        (unsigned long)s_usb_rx_bytes, (unsigned long)s_usb_rx_frames,
+        (unsigned long)s_tcp_rx_bytes, (unsigned long)s_tcp_rx_frames,
+        (unsigned long)s_tcp_rx_errors,
         (unsigned long)s_telemetry_ticks, (unsigned long)s_catalog_count,
         (unsigned long)s_selected_sample_count, (unsigned long)s_selected_packet_count,
         (unsigned long)s_selected_drop_count,
@@ -574,8 +577,8 @@ static void send_status(uint16_t seq)
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
     if (n > 0 && (size_t)n < MAMBA_LINK_MAX_PAYLOAD) {
-        send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_STATUS, seq, json, (size_t)n);
         send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_STATUS, seq, json, (size_t)n);
+        send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_STATUS, seq, json, (size_t)n);
     } else {
         send_error(seq, "status too large");
     }
@@ -958,11 +961,15 @@ static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len, 
                         handle_audio_stream_pcm(&frame);
                         if (from_usb) {
                             s_usb_rx_frames++;
+                        } else {
+                            s_tcp_rx_frames++;
                         }
                     } else {
                         handle_frame(&frame);
                         if (from_usb) {
                             s_usb_rx_frames++;
+                        } else {
+                            s_tcp_rx_frames++;
                         }
                     }
                 }
@@ -984,32 +991,6 @@ static void usb_rx_task(void *arg)
             parser_feed(&parser, buf, (size_t)n, true);
         } else {
             s_usb_rx_empty++;
-        }
-    }
-}
-
-static void tcp_rx_task(void *arg)
-{
-    link_parser_t parser = {0};
-    uint8_t buf[256];
-    while (true) {
-        int sock = -1;
-        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            sock = s_tcp_sock;
-            xSemaphoreGive(s_lock);
-        }
-        if (sock < 0) {
-            vTaskDelay(pdMS_TO_TICKS(250));
-            continue;
-        }
-        int n = recv(sock, buf, sizeof(buf), 0);
-        if (n > 0) {
-            parser_feed(&parser, buf, (size_t)n, false);
-        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            continue;
-        } else {
-            link_detach_tcp_socket(sock);
-            vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
 }
@@ -1301,20 +1282,31 @@ static void publish_catalog(uint32_t tick)
 static void telemetry_task(void *arg)
 {
     uint32_t tick = 0;
+    TickType_t last_catalog = 0;
     while (true) {
         s_telemetry_ticks++;
         uint32_t interval_ms = s_config.telemetry_interval_ms;
         if (interval_ms < 1 || interval_ms > 2000) {
             interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
         }
+        TickType_t now = xTaskGetTickCount();
+        bool publish_low_rate_catalog =
+            last_catalog == 0 ||
+            (now - last_catalog) >= pdMS_TO_TICKS(MAMBA_CATALOG_INTERVAL_MS);
         if (s_audio_stream_active) {
             drain_realtime_telemetry();
-            publish_catalog(tick++);
+            if (publish_low_rate_catalog) {
+                publish_catalog(tick++);
+                last_catalog = now;
+            }
             vTaskDelay(pdMS_TO_TICKS(interval_ms));
             continue;
         }
         publish_can_last();
-        publish_catalog(tick++);
+        if (publish_low_rate_catalog) {
+            publish_catalog(tick++);
+            last_catalog = now;
+        }
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
     }
 }
@@ -1332,6 +1324,7 @@ void link_attach_tcp_socket(int sock, uint32_t host_ip_addr)
             close(s_tcp_sock);
         }
         s_tcp_sock = sock;
+        s_tcp_parser.len = 0;
         xSemaphoreGive(s_lock);
     }
     link_set_udp_target(host_ip_addr, s_config.udp_hello_port, s_config.udp_telemetry_port);
@@ -1364,6 +1357,15 @@ bool link_is_tcp_socket_attached(int sock)
         xSemaphoreGive(s_lock);
     }
     return attached;
+}
+
+void link_handle_tcp_rx_data(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0) {
+        return;
+    }
+    s_tcp_rx_bytes += (uint32_t)len;
+    parser_feed(&s_tcp_parser, data, len, false);
 }
 
 void link_set_udp_target(uint32_t host_ip_addr, uint16_t hello_port, uint16_t telemetry_port)
@@ -1402,7 +1404,6 @@ esp_err_t link_init(const mamba_config_t *config)
         ESP_LOGW(TAG, "usb serial install failed: %s", esp_err_to_name(err));
     }
     BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 4096, NULL, 5, NULL);
-    ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 4096, NULL, 5, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "core link tasks");
     if (xTaskCreate(hello_task, "link_hello", 2048, NULL, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "hello task disabled");
@@ -1410,7 +1411,7 @@ esp_err_t link_init(const mamba_config_t *config)
     if (xTaskCreate(telemetry_task, "link_tel", 3072, NULL, 6, NULL) != pdPASS) {
         ESP_LOGW(TAG, "telemetry task disabled");
     }
-    if (xTaskCreate(selected_sample_task, "link_sel_s", 3072, NULL, 10, NULL) != pdPASS) {
+    if (xTaskCreate(selected_sample_task, "link_sel_s", 3072, NULL, 6, NULL) != pdPASS) {
         ESP_LOGW(TAG, "selected sample task disabled");
     }
     if (xTaskCreate(selected_tx_task, "link_sel_tx", 3072, NULL, 7, NULL) != pdPASS) {

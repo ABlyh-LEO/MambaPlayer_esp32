@@ -356,6 +356,35 @@ class AudioUploadWorker(QtCore.QThread):
         self.finished_ok.emit(self.kind, len(wav), float(info.get("gain_db", 0.0)))
 
 
+class SpeakerControlWorker(QtCore.QThread):
+    started = QtCore.Signal(str)
+    stopped = QtCore.Signal()
+    failed = QtCore.Signal(str, str)
+
+    def __init__(self, transport, action: str, peer_ip: str = "", sample_rate: int = 16000) -> None:
+        super().__init__()
+        self.transport = transport
+        self.action = action
+        self.peer_ip = peer_ip
+        self.sample_rate = sample_rate
+
+    def run(self) -> None:
+        try:
+            if self.action == "start":
+                try:
+                    self.transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=1.5)
+                except Exception:
+                    pass
+                payload = json.dumps({"sample_rate": self.sample_rate}).encode()
+                self.transport.send_wait(TYPE_AUDIO_STREAM_START, payload, timeout=8.0)
+                self.started.emit(self.peer_ip)
+            else:
+                self.transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=3.0)
+                self.stopped.emit()
+        except Exception as exc:
+            self.failed.emit(self.action, str(exc))
+
+
 class SpeakerCapture(QtCore.QThread):
     pcm_ready = QtCore.Signal(bytes)
     state = QtCore.Signal(str)
@@ -509,6 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.udp_tel = UdpListener(UDP_TELEMETRY_PORT)
         self.serial_worker: SerialWorker | None = None
         self.audio_upload_worker: AudioUploadWorker | None = None
+        self.speaker_control_worker: SpeakerControlWorker | None = None
         self.speaker_worker: SpeakerCapture | None = None
         self.speaker_udp: socket.socket | None = None
         self.speaker_udp_target: tuple[str, int] | None = None
@@ -517,6 +547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.speaker_udp_packets = 0
         self.speaker_udp_bytes = 0
         self.speaker_udp_last_error = ""
+        self._speaker_changing = False
         self.vofa_forwarder = VofaForwarder()
         self.vofa_timer = QtCore.QTimer(self)
         self.vofa_timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -1092,47 +1123,94 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_upload_worker.start()
 
     def _toggle_speaker(self, enabled: bool) -> None:
+        if self._speaker_changing:
+            return
         transport = self._active_transport(prefer_tcp=True)
         if enabled:
             peer_ip = self._speaker_peer_ip()
             if not transport or not peer_ip:
                 QtWidgets.QMessageBox.warning(self, "Speaker Mode", "Connect TCP/Wi-Fi before starting low-latency speaker mode.")
-                self.speaker_button.setChecked(False)
+                self._set_speaker_checked(False)
                 return
-            try:
-                try:
-                    transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=1.5)
-                except Exception:
-                    pass
-                transport.send_wait(TYPE_AUDIO_STREAM_START, json.dumps({"sample_rate": 16000}).encode(), timeout=3.0)
-            except Exception as exc:
-                try:
-                    transport.send(TYPE_AUDIO_STREAM_STOP, b"{}")
-                except Exception:
-                    pass
-                QtWidgets.QMessageBox.warning(self, "Speaker Mode", str(exc))
-                self.speaker_button.setChecked(False)
-                return
-            self._start_speaker_udp(peer_ip)
-            self.speaker_worker = SpeakerCapture()
-            self.speaker_worker.pcm_ready.connect(self._send_speaker_pcm, QtCore.Qt.DirectConnection)
-            self.speaker_worker.state.connect(self._log)
-            self.speaker_worker.failed.connect(lambda msg: QtWidgets.QMessageBox.warning(self, "Speaker Mode", msg))
-            self.speaker_worker.start()
-            self.speaker_button.setText("Stop Speaker Mode")
-            self.audio_status.setText(f"speaker UDP {peer_ip}:{SPEAKER_UDP_PORT}")
+            self._begin_speaker_control("start", transport, peer_ip)
         else:
-            if self.speaker_worker:
-                self._stop_worker(self.speaker_worker)
-                self.speaker_worker = None
-            self._close_speaker_udp()
-            transport = self._active_transport(prefer_tcp=True)
+            self._stop_local_speaker_capture()
             if transport:
-                try:
-                    transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=3.0)
-                except Exception as exc:
-                    self._log(f"speaker stop failed: {exc}")
+                self._begin_speaker_control("stop", transport)
+            else:
+                self._finish_speaker_stopped()
+
+    def _begin_speaker_control(self, action: str, transport, peer_ip: str = "") -> None:
+        if self.speaker_control_worker and self.speaker_control_worker.isRunning():
+            return
+        self.speaker_button.setEnabled(False)
+        self.speaker_button.setText("Starting Speaker Mode..." if action == "start" else "Stopping Speaker Mode...")
+        self.audio_status.setText("speaker control pending")
+        worker = SpeakerControlWorker(transport, action, peer_ip)
+        worker.started.connect(self._finish_speaker_started)
+        worker.stopped.connect(self._finish_speaker_stopped)
+        worker.failed.connect(self._speaker_control_failed)
+        worker.finished.connect(self._speaker_control_finished)
+        self.speaker_control_worker = worker
+        worker.start()
+
+    def _finish_speaker_started(self, peer_ip: str) -> None:
+        self._start_speaker_udp(peer_ip)
+        self.speaker_worker = SpeakerCapture()
+        self.speaker_worker.pcm_ready.connect(self._send_speaker_pcm, QtCore.Qt.DirectConnection)
+        self.speaker_worker.state.connect(self._log)
+        self.speaker_worker.failed.connect(self._speaker_capture_failed)
+        self.speaker_worker.start()
+        self.speaker_button.setText("Stop Speaker Mode")
+        self.speaker_button.setEnabled(True)
+        self.audio_status.setText(f"speaker UDP {peer_ip}:{SPEAKER_UDP_PORT}")
+
+    def _finish_speaker_stopped(self) -> None:
+        self._stop_local_speaker_capture()
+        self.speaker_button.setText("Start Speaker Mode")
+        self.speaker_button.setEnabled(True)
+        self._set_speaker_checked(False)
+        self.audio_status.setText("speaker stopped")
+
+    def _speaker_control_failed(self, action: str, message: str) -> None:
+        if action == "start":
+            try:
+                transport = self._active_transport(prefer_tcp=True)
+                if transport:
+                    transport.send(TYPE_AUDIO_STREAM_STOP, b"{}")
+            except Exception:
+                pass
+            self._stop_local_speaker_capture()
+            self._set_speaker_checked(False)
             self.speaker_button.setText("Start Speaker Mode")
+        else:
+            self.speaker_button.setText("Start Speaker Mode")
+            self._set_speaker_checked(False)
+        self.speaker_button.setEnabled(True)
+        self.audio_status.setText(f"speaker {action} failed")
+        QtWidgets.QMessageBox.warning(self, "Speaker Mode", message)
+
+    def _speaker_control_finished(self) -> None:
+        self.speaker_control_worker = None
+
+    def _speaker_capture_failed(self, message: str) -> None:
+        QtWidgets.QMessageBox.warning(self, "Speaker Mode", message)
+        self._stop_local_speaker_capture()
+        self._set_speaker_checked(False)
+        transport = self._active_transport(prefer_tcp=True)
+        if transport:
+            self._begin_speaker_control("stop", transport)
+
+    def _set_speaker_checked(self, checked: bool) -> None:
+        self._speaker_changing = True
+        self.speaker_button.setChecked(checked)
+        self._speaker_changing = False
+
+    def _stop_local_speaker_capture(self) -> None:
+        if self.speaker_worker:
+            self._stop_worker(self.speaker_worker)
+            self.speaker_worker = None
+        self._close_speaker_udp()
 
     def _send_speaker_pcm(self, payload: bytes) -> None:
         if not self.speaker_udp or not self.speaker_udp_target:
@@ -1217,17 +1295,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._shutdown_done = True
         self._save_project()
+        if self.speaker_control_worker and self.speaker_control_worker.isRunning():
+            self.speaker_control_worker.wait(9000)
         if self.speaker_worker:
-            self._stop_worker(self.speaker_worker)
-            self.speaker_worker = None
-            self._close_speaker_udp()
+            self._stop_local_speaker_capture()
             transport = self._active_transport(prefer_tcp=True)
             if transport:
                 try:
                     transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=1.0)
                 except Exception as exc:
                     self._log(f"speaker stop during shutdown failed: {exc}")
-        for worker in (self.speaker_worker, self.serial_worker, self.tcp, self.udp_hello, self.udp_tel, self.vofa_forwarder):
+        for worker in (self.speaker_control_worker, self.speaker_worker, self.serial_worker, self.tcp, self.udp_hello, self.udp_tel, self.vofa_forwarder):
             if worker:
                 self._stop_worker(worker)
 
