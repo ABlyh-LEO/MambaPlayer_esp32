@@ -152,6 +152,12 @@ static void tcp_client_task(void *arg)
             .sin_addr.s_addr = ip.gw.addr,
         };
         if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
+            struct timeval tv = {
+                .tv_sec = 0,
+                .tv_usec = 200000,
+            };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             ESP_LOGI(TAG, "connected to host " IPSTR ":%u", IP2STR(&ip.gw), tcp_port);
             link_attach_tcp_socket(sock, ip.gw.addr);
             while ((xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT) != 0 &&

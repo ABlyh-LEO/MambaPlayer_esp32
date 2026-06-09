@@ -18,14 +18,17 @@ The app listens on:
 - UDP `37211` for device hello packets.
 - UDP `37212` for v2 realtime telemetry.
 
-USB Serial/JTAG uses the same MambaLink frame format as TCP. The GUI sends
-control and audio upload over USB when a device is connected; if USB is not
-connected, it uses the active TCP device connection.
+USB Serial/JTAG uses the same MambaLink frame format as TCP. When both links
+are available, the GUI prefers TCP for control, audio upload and Speaker Mode
+to avoid USB-open resets and to keep PCM streaming smooth. USB remains the
+fallback path and is still used for first-time Wi-Fi configuration.
 
 ## Data Hub Workflow
 
 - The firmware sends a low-rate source catalog. The left table shows available
   keys, latest values, units and nominal source rates.
+- If UDP telemetry is unavailable, the GUI can also populate the source table
+  from TCP status and USB telemetry catalog frames.
 - Select a row in the source table, add up to 16 source keys to the Firmware
   1 kHz table, then apply the stream configuration. These are the only values
   sampled into the firmware-side selected-values UDP stream.

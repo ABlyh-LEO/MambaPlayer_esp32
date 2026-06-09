@@ -18,7 +18,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
@@ -26,7 +25,6 @@
 #include "storage.h"
 #include "telemetry_mux.h"
 
-#define LINK_QUEUE_DEPTH 8
 #define LINK_HEADER_LEN 12
 #define LINK_UDP_MAX 1200
 
@@ -77,7 +75,6 @@ typedef struct {
 } selected_channel_t;
 
 static const char *TAG = "link";
-static QueueHandle_t s_rx_queue;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_tx_lock;
 static mamba_config_t s_config;
@@ -89,6 +86,12 @@ static uint16_t s_udp_hello_port = MAMBA_LINK_UDP_HELLO_PORT;
 static uint16_t s_udp_tel_port = MAMBA_LINK_UDP_TELEMETRY_PORT;
 static uint16_t s_seq;
 static uint32_t s_udp_seq;
+static volatile uint32_t s_udp_send_count;
+static volatile uint32_t s_udp_send_errors;
+static volatile int s_udp_last_errno;
+static volatile uint8_t s_udp_last_stream;
+static volatile uint32_t s_telemetry_ticks;
+static volatile uint32_t s_catalog_count;
 static audio_upload_t s_upload;
 static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
 static volatile uint32_t s_usb_rx_bytes;
@@ -451,7 +454,14 @@ static void send_udp_payload(uint8_t stream_id, const void *payload, size_t len)
         .sin_port = htons(s_udp_tel_port),
         .sin_addr.s_addr = s_udp_host,
     };
-    (void)sendto(udp_sock, buf, len + 20, 0, (struct sockaddr *)&dst, sizeof(dst));
+    int sent = sendto(udp_sock, buf, len + 20, 0, (struct sockaddr *)&dst, sizeof(dst));
+    s_udp_last_stream = stream_id;
+    if (sent > 0) {
+        s_udp_send_count++;
+    } else {
+        s_udp_send_errors++;
+        s_udp_last_errno = errno;
+    }
 }
 
 static void send_status(uint16_t seq)
@@ -480,6 +490,8 @@ static void send_status(uint16_t seq)
         "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu}},"
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
         "\"forward_filter\":\"%s\",\"parser\":\"host\"},"
+        "\"link\":{\"udp_tel\":%u,\"udp_sent\":%lu,\"udp_errors\":%lu,\"udp_errno\":%d,\"udp_stream\":%u,"
+        "\"tel_ticks\":%lu,\"catalogs\":%lu,\"stream_active\":%s},"
         "\"storage\":{\"total\":%u,\"used\":%u},"
         "\"wifi\":{\"ssid\":\"%s\",\"tcp_port\":%u,\"udp_hello\":%u,\"udp_telemetry\":%u}}",
         MAMBA_FIRMWARE_VERSION, MAMBA_PROTOCOL_VERSION, s_config.device_name,
@@ -494,6 +506,10 @@ static void send_status(uint16_t seq)
         (unsigned long)audio.last_write_bytes,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count, s_config.can_filter,
+        s_udp_tel_port, (unsigned long)s_udp_send_count, (unsigned long)s_udp_send_errors,
+        s_udp_last_errno, s_udp_last_stream,
+        (unsigned long)s_telemetry_ticks, (unsigned long)s_catalog_count,
+        s_audio_stream_active ? "true" : "false",
         (unsigned)storage.total_bytes, (unsigned)storage.used_bytes,
         s_config.wifi_ssid, s_config.tcp_port, s_config.udp_hello_port, s_config.udp_telemetry_port);
     if (n > 0 && (size_t)n < MAMBA_LINK_MAX_PAYLOAD) {
@@ -710,9 +726,9 @@ static void handle_audio_stream_start(const link_rx_frame_t *frame)
     body[frame->len] = 0;
     uint32_t rate = MAMBA_AUDIO_SAMPLE_RATE_HZ;
     json_get_u32(body, "sample_rate", &rate);
-    s_audio_stream_active = true;
     esp_err_t err = audio_stream_start(rate);
     if (err == ESP_OK) {
+        s_audio_stream_active = true;
         send_ack(frame->seq, "audio stream start");
     } else {
         s_audio_stream_active = false;
@@ -736,15 +752,15 @@ static void handle_audio_stream_pcm(const link_rx_frame_t *frame)
 
 static void handle_audio_stream_stop(const link_rx_frame_t *frame)
 {
+    s_audio_stream_active = false;
     esp_err_t err = audio_stream_stop();
-    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
-        s_audio_stream_active = false;
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE || err == ESP_ERR_TIMEOUT) {
         alarm_status_t alarm = {0};
         alarm_get_status(&alarm);
         if (alarm.active) {
             audio_play_alarm(s_config.alarm_file, audio_get_alarm_offset());
         }
-        send_ack(frame->seq, "audio stream stop");
+        send_ack(frame->seq, err == ESP_ERR_TIMEOUT ? "audio stream stop pending" : "audio stream stop");
     } else {
         char text[64];
         snprintf(text, sizeof(text), "audio stream stop failed: %s", esp_err_to_name(err));
@@ -877,7 +893,8 @@ static void parser_feed(link_parser_t *parser, const uint8_t *data, size_t len, 
                             s_usb_rx_frames++;
                         }
                     } else {
-                        if (xQueueSend(s_rx_queue, &frame, 0) == pdTRUE && from_usb) {
+                        handle_frame(&frame);
+                        if (from_usb) {
                             s_usb_rx_frames++;
                         }
                     }
@@ -921,19 +938,11 @@ static void tcp_rx_task(void *arg)
         int n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
             parser_feed(&parser, buf, (size_t)n, false);
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
         } else {
             link_detach_tcp_socket(sock);
             vTaskDelay(pdMS_TO_TICKS(250));
-        }
-    }
-}
-
-static void command_task(void *arg)
-{
-    link_rx_frame_t frame;
-    while (true) {
-        if (xQueueReceive(s_rx_queue, &frame, portMAX_DELAY) == pdTRUE) {
-            handle_frame(&frame);
         }
     }
 }
@@ -1033,7 +1042,7 @@ static void publish_can_last(void)
 
 static void publish_catalog(uint32_t tick)
 {
-    if ((tick % 500) != 0) {
+    if ((tick % 50) != 0) {
         return;
     }
     battery_snapshot_t bat;
@@ -1082,6 +1091,7 @@ static void publish_catalog(uint32_t tick)
     if (n > 0 && n < (int)(sizeof(json) - used)) {
         used += (size_t)n;
         send_udp_payload(MAMBA_STREAM_CATALOG, json, used);
+        s_catalog_count++;
         if (!s_upload_active) {
             send_frame(LINK_TX_USB, MAMBA_LINK_TYPE_TELEMETRY, s_seq++, json, used);
         }
@@ -1092,12 +1102,14 @@ static void telemetry_task(void *arg)
 {
     uint32_t tick = 0;
     while (true) {
+        s_telemetry_ticks++;
         uint32_t interval_ms = s_config.telemetry_interval_ms;
         if (interval_ms < 1 || interval_ms > 2000) {
             interval_ms = MAMBA_TELEMETRY_BATCH_INTERVAL_MS;
         }
         if (s_audio_stream_active) {
             drain_realtime_telemetry();
+            publish_catalog(tick++);
             vTaskDelay(pdMS_TO_TICKS(interval_ms));
             continue;
         }
@@ -1117,6 +1129,7 @@ void link_attach_tcp_socket(int sock, uint32_t host_ip_addr)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (s_tcp_sock >= 0 && s_tcp_sock != sock) {
+            shutdown(s_tcp_sock, SHUT_RDWR);
             close(s_tcp_sock);
         }
         s_tcp_sock = sock;
@@ -1124,12 +1137,14 @@ void link_attach_tcp_socket(int sock, uint32_t host_ip_addr)
     }
     link_set_udp_target(host_ip_addr, s_config.udp_hello_port, s_config.udp_telemetry_port);
     send_status(0);
+    publish_catalog(0);
 }
 
 void link_detach_tcp_socket(int sock)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (s_tcp_sock == sock) {
+            shutdown(s_tcp_sock, SHUT_RDWR);
             close(s_tcp_sock);
             s_tcp_sock = -1;
         }
@@ -1172,8 +1187,7 @@ esp_err_t link_init(const mamba_config_t *config)
     }
     s_lock = xSemaphoreCreateMutex();
     s_tx_lock = xSemaphoreCreateMutex();
-    s_rx_queue = xQueueCreate(LINK_QUEUE_DEPTH, sizeof(link_rx_frame_t));
-    ESP_RETURN_ON_FALSE(s_lock && s_tx_lock && s_rx_queue, ESP_ERR_NO_MEM, TAG, "alloc");
+    ESP_RETURN_ON_FALSE(s_lock && s_tx_lock, ESP_ERR_NO_MEM, TAG, "alloc");
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_cfg.rx_buffer_size = 512;
     usb_cfg.tx_buffer_size = 512;
@@ -1183,9 +1197,8 @@ esp_err_t link_init(const mamba_config_t *config)
     }
     BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 6144, NULL, 5, NULL);
     ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 6144, NULL, 5, NULL);
-    ok &= xTaskCreate(command_task, "link_cmd", 4096, NULL, 5, NULL);
     ok &= xTaskCreate(hello_task, "link_hello", 3072, NULL, 3, NULL);
-    ok &= xTaskCreate(telemetry_task, "link_tel", 4096, NULL, 3, NULL);
+    ok &= xTaskCreate(telemetry_task, "link_tel", 4096, NULL, 6, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "tasks");
     ESP_LOGI(TAG, "MambaLink v%u ready, self-test=%s", MAMBA_PROTOCOL_VERSION, link_self_test() ? "ok" : "fail");
     return ESP_OK;

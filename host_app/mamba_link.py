@@ -64,6 +64,8 @@ def encode_frame(msg_type: int, payload: bytes = b"", seq: int = 0) -> bytes:
 class FrameParser:
     def __init__(self) -> None:
         self._buf = bytearray()
+        self.bad_version_count = 0
+        self.last_bad_version: int | None = None
 
     def feed(self, data: bytes) -> list[Frame]:
         out: list[Frame] = []
@@ -78,6 +80,8 @@ class FrameParser:
             if len(self._buf) < 12:
                 break
             if self._buf[2] != VERSION:
+                self.last_bad_version = self._buf[2]
+                self.bad_version_count += 1
                 del self._buf[:2]
                 continue
             msg_type = self._buf[3]

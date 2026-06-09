@@ -7,6 +7,7 @@ import numpy as np
 from PySide6 import QtWidgets
 
 from .telemetry.store import TelemetryStore
+from .mamba_link import TYPE_STATUS, TYPE_TELEMETRY
 from .ui.main_window import MainWindow
 from .ui.theme import apply_light_theme
 
@@ -83,6 +84,30 @@ class HostGuiSmokeTests(unittest.TestCase):
             window._mock_tick()
             self.app.processEvents()
             self.assertEqual(window.source_combo.currentData(), "justfloat.1")
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_usb_catalog_frame_populates_sources(self):
+        window = MainWindow(start_workers=False)
+        try:
+            payload = b'{"type":"catalog","sources":[{"key":"adc.raw","name":"ADC Raw","unit":"","value":123,"rate_hz":500}]}'
+            window._handle_frame(TYPE_TELEMETRY, payload)
+            self.app.processEvents()
+            self.assertIn("adc.raw", window.sources)
+            self.assertEqual(window.sources_table.rowCount(), 1)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_status_frame_populates_fallback_sources(self):
+        window = MainWindow(start_workers=False)
+        try:
+            payload = b'{"battery":{"adc_mv":22000,"capacity":42,"fused_mv":22100,"current_ma":-120,"temp_decic":265}}'
+            window._handle_frame(TYPE_STATUS, payload)
+            self.app.processEvents()
+            self.assertEqual(window.sources["adc.battery_mv"].value, 22000)
+            self.assertEqual(window.sources["i2c.capacity"].value, 42)
         finally:
             window.close()
             self.app.processEvents()

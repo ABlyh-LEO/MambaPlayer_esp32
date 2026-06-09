@@ -24,6 +24,7 @@ try:
         TYPE_SET_CAN_FORWARD_IDS,
         TYPE_SET_STREAM_CHANNELS,
         TYPE_STATUS,
+        TYPE_TELEMETRY,
         TYPE_WIFI_CONFIG,
         FrameParser,
         decode_udp_packet,
@@ -43,6 +44,7 @@ except ImportError:
         TYPE_SET_CAN_FORWARD_IDS,
         TYPE_SET_STREAM_CHANNELS,
         TYPE_STATUS,
+        TYPE_TELEMETRY,
         TYPE_WIFI_CONFIG,
         FrameParser,
         decode_udp_packet,
@@ -133,7 +135,14 @@ def vofa_test(host: str, remote_port: int, local_port: int, values: list[float])
 
 def wait_usb_ready(ser, parser: FrameParser, timeout: float) -> None:
     deadline = time.time() + timeout
+    next_ping = 0.0
+    seq = 0x7000
     while time.time() < deadline:
+        if time.time() >= next_ping:
+            ser.write(encode_frame(TYPE_GET_STATUS, b"{}", seq))
+            ser.flush()
+            seq = (seq + 1) & 0xFFFF or 1
+            next_ping = time.time() + 0.5
         data = ser.read(512)
         if parser.feed(data):
             return
@@ -180,6 +189,9 @@ def usb_status(port: str, baud: int, timeout: float) -> int:
             data = ser.read(512)
             for frame in parser.feed(data):
                 if frame.msg_type == TYPE_STATUS:
+                    print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
+                    return 0
+                if frame.msg_type == TYPE_TELEMETRY and frame.payload.lstrip().startswith(b"{"):
                     print(json.dumps({"type": frame.msg_type, "seq": frame.seq, "payload": frame.payload.decode(errors="replace")}, ensure_ascii=False))
                     return 0
     return 1

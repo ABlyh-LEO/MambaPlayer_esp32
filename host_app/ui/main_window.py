@@ -34,6 +34,7 @@ from ..mamba_link import (
     TYPE_SET_CAN_FORWARD_IDS,
     TYPE_SET_STREAM_CHANNELS,
     TYPE_STATUS,
+    TYPE_TELEMETRY,
     TYPE_WIFI_CONFIG,
     FrameParser,
     decode_udp_packet,
@@ -67,6 +68,7 @@ DEFAULT_SPIFFS_TOTAL_BYTES = STORAGE_PARTITION_BYTES
 class TcpServer(QtCore.QThread):
     frame_received = QtCore.Signal(int, bytes)
     client_changed = QtCore.Signal(str)
+    protocol_warning = QtCore.Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -107,6 +109,11 @@ class TcpServer(QtCore.QThread):
                             self._acks[frame.seq] = (frame.msg_type, frame.payload)
                             self._ack_cond.notify_all()
                     self.frame_received.emit(frame.msg_type, frame.payload)
+                if self._parser.last_bad_version is not None:
+                    self.protocol_warning.emit(
+                        f"TCP received MambaLink v{self._parser.last_bad_version}; host expects v2. Reflash current firmware."
+                    )
+                    self._parser.last_bad_version = None
             except socket.timeout:
                 continue
             except OSError:
@@ -170,6 +177,7 @@ class TcpServer(QtCore.QThread):
 class UdpListener(QtCore.QThread):
     telemetry = QtCore.Signal(dict)
     hello = QtCore.Signal(str)
+    warning = QtCore.Signal(str)
 
     def __init__(self, port: int) -> None:
         super().__init__()
@@ -195,7 +203,9 @@ class UdpListener(QtCore.QThread):
                     item = decode_udp_packet(data)
                     item["addr"] = addr[0]
                     self.telemetry.emit(item)
-                except ValueError:
+                except ValueError as exc:
+                    if data[:2] == b"MT" and len(data) >= 3:
+                        self.warning.emit(f"UDP telemetry version mismatch or bad packet: v{data[2]} ({exc})")
                     continue
         sock.close()
 
@@ -207,6 +217,7 @@ class SerialWorker(QtCore.QThread):
     frame_received = QtCore.Signal(int, bytes)
     state = QtCore.Signal(str)
     ready = QtCore.Signal()
+    protocol_warning = QtCore.Signal(str)
 
     def __init__(self, port: str, baud: int = 115200) -> None:
         super().__init__()
@@ -220,6 +231,7 @@ class SerialWorker(QtCore.QThread):
         self._ack_cond = threading.Condition()
         self._acks: dict[int, tuple[int, bytes]] = {}
         self._seq = 1
+        self._send_lock = threading.Lock()
 
     def run(self) -> None:
         if serial is None:
@@ -228,6 +240,9 @@ class SerialWorker(QtCore.QThread):
         try:
             self._ser = serial.Serial(self.port, self.baud, timeout=0.1, write_timeout=8)
             self.state.emit(self.port)
+            self._ready.set()
+            self._ready_emitted = True
+            self.ready.emit()
         except Exception as exc:
             self.state.emit(str(exc))
             return
@@ -246,13 +261,19 @@ class SerialWorker(QtCore.QThread):
                         self._acks[frame.seq] = (frame.msg_type, frame.payload)
                         self._ack_cond.notify_all()
                 self.frame_received.emit(frame.msg_type, frame.payload)
+            if self._parser.last_bad_version is not None:
+                self.protocol_warning.emit(
+                    f"USB received MambaLink v{self._parser.last_bad_version}; host expects v2. Reflash current firmware."
+                )
+                self._parser.last_bad_version = None
         if self._ser:
             self._ser.close()
 
     def send(self, msg_type: int, payload: bytes = b"") -> None:
         if self._ser:
             self._ready.wait(timeout=2.0)
-            self._ser.write(encode_frame(msg_type, payload, self._next_seq()))
+            with self._send_lock:
+                self._ser.write(encode_frame(msg_type, payload, self._next_seq()))
 
     def send_wait(self, msg_type: int, payload: bytes = b"", timeout: float = 3.0) -> bytes:
         if not self._ser:
@@ -261,8 +282,9 @@ class SerialWorker(QtCore.QThread):
         seq = self._next_seq()
         with self._ack_cond:
             self._acks.pop(seq, None)
-        self._ser.write(encode_frame(msg_type, payload, seq))
-        self._ser.flush()
+        with self._send_lock:
+            self._ser.write(encode_frame(msg_type, payload, seq))
+            self._ser.flush()
         deadline = time.monotonic() + timeout
         with self._ack_cond:
             while seq not in self._acks:
@@ -417,6 +439,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vofa_timer.timeout.connect(self._send_vofa_frame)
         self.mock_timer = QtCore.QTimer(self)
         self.mock_timer.timeout.connect(self._mock_tick)
+        self.status_poll_timer = QtCore.QTimer(self)
+        self.status_poll_timer.timeout.connect(self._poll_status_until_sources)
         self._mock_phase = 0.0
         self._shutdown_done = False
         self._build_ui()
@@ -427,6 +451,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tcp.start()
             self.udp_hello.start()
             self.udp_tel.start()
+            self.status_poll_timer.start(2000)
             QtCore.QTimer.singleShot(0, self._auto_connect_serial)
 
     def _build_ui(self) -> None:
@@ -540,8 +565,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _wire(self) -> None:
         self.tcp.frame_received.connect(self._handle_frame)
         self.tcp.client_changed.connect(self._tcp_changed)
+        self.tcp.protocol_warning.connect(self._log)
         self.udp_hello.hello.connect(self._hello_changed)
         self.udp_tel.telemetry.connect(self._handle_telemetry)
+        self.udp_tel.warning.connect(self._log)
         self.theme_button.clicked.connect(self._toggle_theme)
         self.mock_button.toggled.connect(self._toggle_mock)
         self.save_button.clicked.connect(self._save_project)
@@ -579,8 +606,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.serial_combo.addItem("pyserial unavailable", "")
 
-    def _active_transport(self):
-        return self.serial_worker if self.serial_worker else (self.tcp if self.tcp.is_connected() else None)
+    def _active_transport(self, prefer_tcp: bool = True):
+        if prefer_tcp and self.tcp.is_connected():
+            return self.tcp
+        if self.serial_worker:
+            return self.serial_worker
+        return self.tcp if self.tcp.is_connected() else None
 
     def _send(self, msg_type: int, payload: bytes) -> None:
         self.tcp.send(msg_type, payload)
@@ -592,12 +623,58 @@ class MainWindow(QtWidgets.QMainWindow):
         if transport:
             transport.send(msg_type, payload)
 
+    def _poll_status_until_sources(self) -> None:
+        if self.sources:
+            return
+        self._send(TYPE_GET_STATUS, b"{}")
+
     def _handle_frame(self, msg_type: int, payload: bytes) -> None:
         if msg_type == TYPE_STATUS:
-            self._log(payload.decode(errors="replace"))
+            self._handle_status(payload)
             self._write_snapshot()
+        elif msg_type == TYPE_TELEMETRY:
+            self._handle_usb_telemetry(payload)
+        elif msg_type == TYPE_ERROR:
+            self._log(f"device error: {payload.decode(errors='replace')}")
         elif msg_type not in (TYPE_ACK, TYPE_ERROR):
             self._log(f"frame type={msg_type} len={len(payload)}")
+
+    def _handle_status(self, payload: bytes) -> None:
+        text = payload.decode(errors="replace")
+        self._log(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        battery = data.get("battery", {})
+        now = time.monotonic()
+        fallback = [
+            ("adc.battery_mv", "ADC Battery", "mV", battery.get("adc_mv"), 500),
+            ("i2c.capacity", "I2C Capacity", "%", battery.get("capacity"), 2),
+            ("i2c.voltage_mv", "I2C Voltage", "mV", battery.get("fused_mv"), 2),
+            ("i2c.current_ma", "I2C Current", "mA", battery.get("current_ma"), 2),
+            ("i2c.temperature_c", "I2C Temp", "C", (float(battery.get("temp_decic") or 0) / 10.0), 2),
+        ]
+        for key, name, unit, value, rate in fallback:
+            try:
+                self.sources[key] = SourceValue(key=key, name=name, unit=unit, value=float(value or 0), rate_hz=rate, updated_at=now)
+            except (TypeError, ValueError):
+                continue
+        self._refresh_sources_table()
+        self._refresh_firmware_table()
+        self._refresh_channels_table()
+
+    def _handle_usb_telemetry(self, payload: bytes) -> None:
+        if payload.lstrip().startswith(b"{"):
+            try:
+                data = json.loads(payload.decode(errors="replace"))
+            except json.JSONDecodeError:
+                self._log(f"USB telemetry JSON parse failed len={len(payload)}")
+                return
+            if data.get("type") == "catalog":
+                self._handle_catalog(payload)
+                return
+        self._log(f"USB telemetry len={len(payload)}")
 
     def _handle_telemetry(self, item: dict) -> None:
         stream = item["stream_id"]
@@ -616,6 +693,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except (json.JSONDecodeError, ValueError):
             return
         self._refresh_sources_table()
+        self._refresh_firmware_table()
+        self._refresh_channels_table()
         self._write_snapshot()
 
     def _handle_selected(self, payload: bytes) -> None:
@@ -894,15 +973,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_upload_worker.start()
 
     def _toggle_speaker(self, enabled: bool) -> None:
-        transport = self._active_transport()
+        transport = self._active_transport(prefer_tcp=True)
         if enabled:
             if not transport:
                 QtWidgets.QMessageBox.warning(self, "Speaker Mode", "Connect USB or TCP before starting speaker mode.")
                 self.speaker_button.setChecked(False)
                 return
             try:
+                try:
+                    transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=1.5)
+                except Exception:
+                    pass
                 transport.send_wait(TYPE_AUDIO_STREAM_START, json.dumps({"sample_rate": 16000}).encode(), timeout=3.0)
             except Exception as exc:
+                try:
+                    transport.send(TYPE_AUDIO_STREAM_STOP, b"{}")
+                except Exception:
+                    pass
                 QtWidgets.QMessageBox.warning(self, "Speaker Mode", str(exc))
                 self.speaker_button.setChecked(False)
                 return
@@ -916,6 +1003,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.speaker_worker:
                 self._stop_worker(self.speaker_worker)
                 self.speaker_worker = None
+            transport = self._active_transport(prefer_tcp=True)
             if transport:
                 try:
                     transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=3.0)
@@ -924,7 +1012,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.speaker_button.setText("Start Speaker Mode")
 
     def _send_speaker_pcm(self, payload: bytes) -> None:
-        transport = self._active_transport()
+        transport = self._active_transport(prefer_tcp=True)
         if not transport:
             return
         for offset in range(0, len(payload), 960):
@@ -950,6 +1038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_worker = SerialWorker(port)
         self.serial_worker.frame_received.connect(self._handle_frame)
         self.serial_worker.state.connect(lambda text: self.usb_label.setText(f"USB {text}"))
+        self.serial_worker.protocol_warning.connect(self._log)
         self.serial_worker.ready.connect(lambda: self._send(TYPE_GET_STATUS, b"{}"))
         self.serial_worker.start()
 
