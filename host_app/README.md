@@ -30,8 +30,8 @@ TCP/Wi-Fi connection so the host knows the ESP32 address.
 
 - The firmware sends a low-rate source catalog. The left table shows available
   keys, latest values, units and nominal source rates.
-- If UDP telemetry is unavailable, the GUI can also populate the source table
-  from TCP status and USB telemetry catalog frames.
+- If UDP telemetry is unavailable, the GUI can still populate fallback source
+  values from requested TCP/USB status frames.
 - Select a row in the source table, add up to 16 source keys to the Firmware
   1 kHz table, then apply the stream configuration. These are the only values
   sampled into the firmware-side selected-values UDP stream.
@@ -68,9 +68,9 @@ TCP/Wi-Fi connection so the host knows the ESP32 address.
   the target player output device to `CABLE Input (VB-Audio Virtual Cable)`,
   then the app captures `CABLE Output (VB-Audio Virtual Cable)`.
 - Closing the host app sends a stop command first. If TCP is closed abruptly,
-  firmware also stops Speaker Mode on disconnect and only resumes low-voltage
-  alarm audio when the alarm state is active; it does not play the power-on
-  sound from this path.
+  firmware stops Speaker Mode on disconnect without playing the power-on sound;
+  a normal stop command resumes alarm behavior only when the alarm state is
+  active.
 - Firmware creates the Speaker UDP receiver only after `AUDIO_STREAM_START`.
   This keeps boot stable before Wi-Fi/lwIP is ready and avoids opening the audio
   data socket while the device is still initializing.

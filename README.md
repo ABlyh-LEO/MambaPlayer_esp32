@@ -11,12 +11,13 @@ audio, battery, UART JustFloat and CAN monitor.
 - Wi-Fi runs in STA mode. Configure the computer hotspot SSID/password over USB;
   after DHCP, the firmware connects back to the gateway IP on TCP `37210`.
 - TCP `37210` carries reliable MambaLink control, status, configuration, audio
-  upload and speaker PCM streaming.
+  upload and Speaker Mode start/stop commands.
 - UDP `37211` carries hello/heartbeat packets.
 - UDP `37212` carries v2 telemetry: low-rate source catalog, selected 1 kHz
   values, and configured CAN latest-frame forwarding.
 - USB Serial/JTAG also carries MambaLink frames for configuration, status and
-  audio upload when Wi-Fi is not available.
+  audio upload when Wi-Fi is not available. Unrequested low-rate catalog
+  mirroring is disabled on USB; request status explicitly when using USB.
 - UART0 is reserved for external VOFA+ JustFloat input at `1000000 8N1`; it is
   not used for ESP-IDF console logs.
 - CAN defaults to `1 Mbps`. CAN frames are not forwarded by default; the host

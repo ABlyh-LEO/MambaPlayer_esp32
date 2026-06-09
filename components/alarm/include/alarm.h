@@ -19,6 +19,7 @@ typedef struct {
 
 esp_err_t alarm_init(const mamba_config_t *config);
 void alarm_get_status(alarm_status_t *out);
+void alarm_set_speaker_suppressed(bool suppressed);
 bool alarm_self_test(void);
 
 #ifdef __cplusplus

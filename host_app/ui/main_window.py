@@ -81,6 +81,7 @@ class TcpServer(QtCore.QThread):
         self._parser = FrameParser()
         self._ack_cond = threading.Condition()
         self._acks: dict[int, tuple[int, bytes]] = {}
+        self._connected_cond = threading.Condition()
         self._seq = 1
         self._send_lock = threading.Lock()
         self._peer_ip: str | None = None
@@ -97,6 +98,8 @@ class TcpServer(QtCore.QThread):
                     self._client, addr = self._sock.accept()
                     self._peer_ip = str(addr[0])
                     self._client.settimeout(0.2)
+                    with self._connected_cond:
+                        self._connected_cond.notify_all()
                     self.client_changed.emit(f"{addr[0]}:{addr[1]}")
                     self.send(TYPE_HELLO, b'{"host":"mamba-v2"}')
                     self.send(TYPE_GET_STATUS, b"{}")
@@ -134,14 +137,26 @@ class TcpServer(QtCore.QThread):
             self._close_client()
 
     def send_wait(self, msg_type: int, payload: bytes = b"", timeout: float = 5.0) -> bytes:
-        if self._client is None:
-            raise RuntimeError("TCP is not connected")
         seq = self._next_seq()
         with self._ack_cond:
             self._acks.pop(seq, None)
-        with self._send_lock:
-            self._client.sendall(encode_frame(msg_type, payload, seq))
+        frame = encode_frame(msg_type, payload, seq)
         deadline = time.monotonic() + timeout
+        sent = False
+        while not sent:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timeout waiting for TCP connection seq={seq}")
+            if not self._wait_connected(min(remaining, 0.5)):
+                continue
+            try:
+                with self._send_lock:
+                    if self._client is None:
+                        continue
+                    self._client.sendall(frame)
+                sent = True
+            except OSError:
+                self._close_client()
         with self._ack_cond:
             while seq not in self._acks:
                 remaining = deadline - time.monotonic()
@@ -158,6 +173,18 @@ class TcpServer(QtCore.QThread):
 
     def peer_ip(self) -> str | None:
         return self._peer_ip if self._client is not None else None
+
+    def _wait_connected(self, timeout: float) -> bool:
+        if self._client is not None:
+            return True
+        deadline = time.monotonic() + timeout
+        with self._connected_cond:
+            while self._client is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._connected_cond.wait(remaining)
+        return True
 
     def _next_seq(self) -> int:
         self._seq = (self._seq + 1) & 0xFFFF
@@ -371,10 +398,6 @@ class SpeakerControlWorker(QtCore.QThread):
     def run(self) -> None:
         try:
             if self.action == "start":
-                try:
-                    self.transport.send_wait(TYPE_AUDIO_STREAM_STOP, b"{}", timeout=1.5)
-                except Exception:
-                    pass
                 payload = json.dumps({"sample_rate": self.sample_rate}).encode()
                 self.transport.send_wait(TYPE_AUDIO_STREAM_START, payload, timeout=8.0)
                 self.started.emit(self.peer_ip)

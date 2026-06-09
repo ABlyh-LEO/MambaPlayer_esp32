@@ -42,6 +42,7 @@ esp_err_t audio_stop_and_save_offset(void);
 esp_err_t audio_stream_start(uint32_t sample_rate_hz);
 esp_err_t audio_stream_write_pcm(const int16_t *samples, size_t sample_count);
 esp_err_t audio_stream_stop(void);
+bool audio_stream_is_active(void);
 void audio_reset_alarm_offset(void);
 uint32_t audio_get_alarm_offset(void);
 void audio_get_status(audio_status_t *out);

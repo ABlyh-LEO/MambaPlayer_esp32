@@ -14,6 +14,7 @@ static const char *TAG = "alarm";
 static SemaphoreHandle_t s_lock;
 static alarm_status_t s_status;
 static mamba_config_t s_config;
+static volatile bool s_speaker_suppressed;
 
 static bool should_enter(const battery_snapshot_t *bat, const mamba_config_t *cfg)
 {
@@ -38,6 +39,11 @@ static bool power_on_audio_playing(void)
     audio_status_t audio = {0};
     audio_get_status(&audio);
     return audio.playing && strcmp(audio.file, s_config.power_on_file) == 0;
+}
+
+static bool speaker_stream_active(void)
+{
+    return s_speaker_suppressed || audio_stream_is_active();
 }
 
 bool alarm_self_test(void)
@@ -72,6 +78,11 @@ void alarm_get_status(alarm_status_t *out)
     }
 }
 
+void alarm_set_speaker_suppressed(bool suppressed)
+{
+    s_speaker_suppressed = suppressed;
+}
+
 static void alarm_task(void *arg)
 {
     alarm_status_t st = {0};
@@ -85,7 +96,7 @@ static void alarm_task(void *arg)
                 if (st.enter_candidate_ms == 0) {
                     st.enter_candidate_ms = now;
                 } else if (now - st.enter_candidate_ms >= 2500) {
-                    if (power_on_audio_playing()) {
+                    if (power_on_audio_playing() || speaker_stream_active()) {
                         publish(&st);
                         vTaskDelay(pdMS_TO_TICKS(100));
                         continue;
@@ -100,6 +111,12 @@ static void alarm_task(void *arg)
                 st.enter_candidate_ms = 0;
             }
         } else {
+            if (speaker_stream_active()) {
+                st.exit_candidate_ms = 0;
+                publish(&st);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
             if (should_exit(&bat, &s_config)) {
                 if (st.exit_candidate_ms == 0) {
                     st.exit_candidate_ms = now;

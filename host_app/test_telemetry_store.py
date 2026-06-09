@@ -156,7 +156,7 @@ class HostGuiSmokeTests(unittest.TestCase):
         transport = RecordingTransport()
         worker = SpeakerControlWorker(transport, "start", "192.168.4.2")
         worker.run()
-        self.assertEqual([call[0] for call in transport.calls], [TYPE_AUDIO_STREAM_STOP, TYPE_AUDIO_STREAM_START])
+        self.assertEqual([call[0] for call in transport.calls], [TYPE_AUDIO_STREAM_START])
         self.assertEqual(transport.calls[-1][2], 8.0)
 
 

@@ -554,6 +554,16 @@ esp_err_t audio_stream_stop(void)
     return ESP_OK;
 }
 
+bool audio_stream_is_active(void)
+{
+    bool active = false;
+    if (s_i2s_lock && xSemaphoreTake(s_i2s_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+        active = s_stream_tx != NULL;
+        xSemaphoreGive(s_i2s_lock);
+    }
+    return active;
+}
+
 esp_err_t audio_init(void)
 {
     s_queue = xQueueCreate(4, sizeof(audio_cmd_t));
