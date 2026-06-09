@@ -9,11 +9,13 @@ import numpy as np
 
 from .audio_tools import BYTES_PER_SECOND, POWER_ON_MAX_SECONDS, STORAGE_PARTITION_BYTES, TARGET_RATE, convert_to_mamba_wav, normalize_peak
 from .mamba_link import (
+    SPEAKER_UDP_PAYLOAD_SAMPLES,
     STREAM_SELECTED_VALUES,
     TYPE_HELLO,
     FrameParser,
     crc16_ccitt,
     decode_udp_packet,
+    encode_speaker_udp_packet,
     encode_frame,
 )
 from .router import encode_justfloat, parse_can_last, parse_dji_motor, parse_selected_batch, parse_selected_values, save_project, load_project
@@ -65,6 +67,16 @@ class ProtocolTests(unittest.TestCase):
         data = encode_justfloat([1.0, -2.0])
         self.assertEqual(data[-4:], b"\x00\x00\x80\x7f")
         self.assertEqual(struct.unpack_from("<ff", data), (1.0, -2.0))
+
+    def test_speaker_udp_packet_encoder(self):
+        pcm = b"\x01\x00" * SPEAKER_UDP_PAYLOAD_SAMPLES
+        packet = encode_speaker_udp_packet(7, 123456, pcm)
+        self.assertEqual(packet[:2], b"MS")
+        self.assertEqual(packet[2], 2)
+        self.assertEqual(struct.unpack_from("<I", packet, 4)[0], 7)
+        self.assertEqual(struct.unpack_from("<I", packet, 8)[0], 123456)
+        self.assertEqual(struct.unpack_from("<H", packet, 12)[0], SPEAKER_UDP_PAYLOAD_SAMPLES)
+        self.assertEqual(packet[16:], pcm)
 
     def test_project_json_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

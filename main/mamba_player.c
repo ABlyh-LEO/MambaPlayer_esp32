@@ -16,16 +16,20 @@ void app_main(void)
     esp_log_level_set("*", ESP_LOG_NONE);
 
     mamba_config_t config;
-    ESP_ERROR_CHECK(storage_init(&config));
-    ESP_ERROR_CHECK(telemetry_mux_init());
+    mamba_config_defaults(&config);
+    (void)storage_init(&config);
+    (void)telemetry_mux_init();
 
-    audio_init();
-    audio_play_once(config.power_on_file);
+    esp_err_t audio_err = audio_init();
+    if (audio_err == ESP_OK) {
+        audio_play_once(config.power_on_file);
+    }
     battery_init(&config);
-    can_monitor_init(config.can_bitrate);
-    can_monitor_apply_config(&config);
+    if (can_monitor_init(config.can_bitrate) == ESP_OK) {
+        can_monitor_apply_config(&config);
+    }
     alarm_init(&config);
-    link_init(&config);
+    (void)link_init(&config);
     link_set_config_updated_callback(wifi_client_apply_config);
     wifi_client_init(&config);
     uart_justfloat_init();

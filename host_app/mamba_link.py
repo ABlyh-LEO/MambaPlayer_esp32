@@ -30,6 +30,10 @@ STREAM_CATALOG = 1
 STREAM_SELECTED_VALUES = 2
 STREAM_CAN_LAST = 3
 
+SPEAKER_UDP_MAGIC = b"MS"
+SPEAKER_UDP_PORT = 37213
+SPEAKER_UDP_PAYLOAD_SAMPLES = 80
+
 
 def crc16_ccitt(data: bytes) -> int:
     crc = 0xFFFF
@@ -116,6 +120,20 @@ def decode_udp_packet(packet: bytes) -> dict:
         "timestamp_us": timestamp_us,
         "payload": payload,
     }
+
+
+def encode_speaker_udp_packet(seq: int, timestamp_us: int, pcm16_mono: bytes) -> bytes:
+    if len(pcm16_mono) % 2:
+        raise ValueError("PCM16 payload must contain whole samples")
+    samples = len(pcm16_mono) // 2
+    if samples > 240:
+        raise ValueError("speaker UDP packet is too large")
+    header = bytearray(16)
+    header[0:2] = SPEAKER_UDP_MAGIC
+    header[2] = VERSION
+    header[3] = 0
+    struct.pack_into("<IIHH", header, 4, seq & 0xFFFFFFFF, timestamp_us & 0xFFFFFFFF, samples, len(pcm16_mono))
+    return bytes(header) + pcm16_mono
 
 
 def parse_can_payload(payload: bytes) -> dict:

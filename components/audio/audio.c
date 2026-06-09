@@ -525,7 +525,7 @@ esp_err_t audio_stream_write_pcm(const int16_t *samples, size_t sample_count)
         mono_to_stereo(samples + pos, stereo, frames);
         size_t requested = frames * 2 * sizeof(stereo[0]);
         size_t written = 0;
-        ret = i2s_channel_write(s_stream_tx, stereo, requested, &written, 1000);
+        ret = i2s_channel_write(s_stream_tx, stereo, requested, &written, 20);
         note_i2s_write(requested, written, ret);
         if (ret != ESP_OK || written != requested) {
             break;

@@ -30,6 +30,10 @@
 #define LINK_UDP_MAX 1200
 #define SELECTED_BATCH_SAMPLES 4
 #define SELECTED_BATCH_INTERVAL_US 1000
+#define SPEAKER_UDP_MAGIC0 'M'
+#define SPEAKER_UDP_MAGIC1 'S'
+#define SPEAKER_UDP_HEADER_LEN 16
+#define SPEAKER_UDP_MAX_PACKET 512
 
 typedef enum {
     LINK_TX_USB,
@@ -105,6 +109,13 @@ static volatile uint32_t s_catalog_count;
 static volatile uint32_t s_selected_sample_count;
 static volatile uint32_t s_selected_packet_count;
 static volatile uint32_t s_selected_drop_count;
+static volatile uint32_t s_speaker_udp_rx_packets;
+static volatile uint32_t s_speaker_udp_rx_samples;
+static volatile uint32_t s_speaker_udp_drop_count;
+static volatile uint32_t s_speaker_udp_bad_packets;
+static volatile uint32_t s_speaker_udp_last_seq;
+static volatile int s_speaker_udp_last_errno;
+static TaskHandle_t s_speaker_udp_task_handle;
 static audio_upload_t s_upload;
 static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
 static volatile uint32_t s_usb_rx_bytes;
@@ -117,6 +128,8 @@ static selected_channel_t s_selected[MAMBA_SELECTED_MAX_CHANNELS];
 static uint8_t s_selected_count;
 static float s_selected_batch[SELECTED_BATCH_SAMPLES][MAMBA_SELECTED_MAX_CHANNELS];
 static uint8_t s_selected_batch_count;
+
+static void speaker_udp_task(void *arg);
 
 static int ensure_udp_socket(void)
 {
@@ -133,6 +146,11 @@ static int ensure_udp_socket(void)
 static uint16_t le16(const uint8_t *p)
 {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static void put16(uint8_t *p, uint16_t v)
@@ -426,6 +444,25 @@ static void send_error(uint16_t seq, const char *text)
     send_frame(LINK_TX_TCP, MAMBA_LINK_TYPE_ERROR, seq, text, strlen(text));
 }
 
+static void stop_speaker_stream(bool resume_alarm)
+{
+    if (!s_audio_stream_active) {
+        return;
+    }
+    s_audio_stream_active = false;
+    esp_err_t err = audio_stream_stop();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG, "speaker stream stop failed: %s", esp_err_to_name(err));
+    }
+    if (resume_alarm) {
+        alarm_status_t alarm = {0};
+        alarm_get_status(&alarm);
+        if (alarm.active) {
+            audio_play_alarm(s_config.alarm_file, audio_get_alarm_offset());
+        }
+    }
+}
+
 static void drain_realtime_telemetry(void)
 {
     telemetry_adc_sample_t adc;
@@ -502,7 +539,9 @@ static void send_status(uint16_t seq)
         "\"battery\":{\"i2c\":%s,\"capacity\":%u,\"fused_mv\":%lu,\"adc_mv\":%lu,\"current_ma\":%ld,\"temp_decic\":%d},"
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
         "\"audio\":{\"playing\":%s,\"alarm_file\":\"%s\",\"power_on_file\":\"%s\",\"current\":\"%s\","
-        "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu}},"
+        "\"diag\":{\"i2s_starts\":%lu,\"write_calls\":%lu,\"write_bytes\":%lu,\"write_errors\":%lu,\"last_write_bytes\":%lu,"
+        "\"speaker_udp_packets\":%lu,\"speaker_udp_samples\":%lu,\"speaker_udp_drops\":%lu,\"speaker_udp_bad\":%lu,"
+        "\"speaker_udp_seq\":%lu,\"speaker_udp_errno\":%d,\"speaker_udp_port\":%u}},"
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu,"
         "\"forward_filter\":\"%s\",\"parser\":\"host\"},"
         "\"link\":{\"udp_tel\":%u,\"udp_sent\":%lu,\"udp_errors\":%lu,\"udp_errno\":%d,\"udp_stream\":%u,"
@@ -520,6 +559,10 @@ static void send_status(uint16_t seq)
         (unsigned long)audio.i2s_starts, (unsigned long)audio.write_calls,
         (unsigned long)audio.write_bytes, (unsigned long)audio.write_errors,
         (unsigned long)audio.last_write_bytes,
+        (unsigned long)s_speaker_udp_rx_packets, (unsigned long)s_speaker_udp_rx_samples,
+        (unsigned long)s_speaker_udp_drop_count, (unsigned long)s_speaker_udp_bad_packets,
+        (unsigned long)s_speaker_udp_last_seq, s_speaker_udp_last_errno,
+        MAMBA_LINK_UDP_SPEAKER_PORT,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count, s_config.can_filter,
         s_udp_tel_port, (unsigned long)s_udp_send_count, (unsigned long)s_udp_send_errors,
@@ -723,8 +766,7 @@ static void handle_audio_test(const link_rx_frame_t *frame)
 {
     if (bytes_contains(frame->payload, frame->len, "stop")) {
         audio_stop_and_save_offset();
-        audio_stream_stop();
-        s_audio_stream_active = false;
+        stop_speaker_stream(false);
     } else if (bytes_contains(frame->payload, frame->len, "tone30")) {
         audio_play_tone(30000, 1000);
     } else if (bytes_contains(frame->payload, frame->len, "tone")) {
@@ -747,7 +789,22 @@ static void handle_audio_stream_start(const link_rx_frame_t *frame)
     esp_err_t err = audio_stream_start(rate);
     if (err == ESP_OK) {
         s_audio_stream_active = true;
-        send_ack(frame->seq, "audio stream start");
+        s_speaker_udp_rx_packets = 0;
+        s_speaker_udp_rx_samples = 0;
+        s_speaker_udp_drop_count = 0;
+        s_speaker_udp_bad_packets = 0;
+        s_speaker_udp_last_seq = 0;
+        s_speaker_udp_last_errno = 0;
+        if (!s_speaker_udp_task_handle &&
+            xTaskCreate(speaker_udp_task, "link_spk_udp", 3072, NULL, 5, &s_speaker_udp_task_handle) != pdPASS) {
+            s_audio_stream_active = false;
+            audio_stream_stop();
+            send_error(frame->seq, "speaker UDP task start failed");
+            return;
+        }
+        char text[64];
+        snprintf(text, sizeof(text), "audio stream start udp:%u", MAMBA_LINK_UDP_SPEAKER_PORT);
+        send_ack(frame->seq, text);
     } else {
         s_audio_stream_active = false;
         char text[64];
@@ -770,20 +827,8 @@ static void handle_audio_stream_pcm(const link_rx_frame_t *frame)
 
 static void handle_audio_stream_stop(const link_rx_frame_t *frame)
 {
-    s_audio_stream_active = false;
-    esp_err_t err = audio_stream_stop();
-    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE || err == ESP_ERR_TIMEOUT) {
-        alarm_status_t alarm = {0};
-        alarm_get_status(&alarm);
-        if (alarm.active) {
-            audio_play_alarm(s_config.alarm_file, audio_get_alarm_offset());
-        }
-        send_ack(frame->seq, err == ESP_ERR_TIMEOUT ? "audio stream stop pending" : "audio stream stop");
-    } else {
-        char text[64];
-        snprintf(text, sizeof(text), "audio stream stop failed: %s", esp_err_to_name(err));
-        send_error(frame->seq, text);
-    }
+    stop_speaker_stream(true);
+    send_ack(frame->seq, "audio stream stop");
 }
 
 static void handle_set_stream_channels(const link_rx_frame_t *frame)
@@ -990,6 +1035,81 @@ static void hello_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+}
+
+static void speaker_udp_task(void *arg)
+{
+    int sock = -1;
+    while (s_audio_stream_active) {
+        if (sock < 0) {
+            sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            if (sock < 0) {
+                s_speaker_udp_last_errno = errno;
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            struct sockaddr_in addr = {
+                .sin_family = AF_INET,
+                .sin_port = htons(MAMBA_LINK_UDP_SPEAKER_PORT),
+                .sin_addr.s_addr = htonl(INADDR_ANY),
+            };
+            if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                s_speaker_udp_last_errno = errno;
+                close(sock);
+                sock = -1;
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            struct timeval timeout = {
+                .tv_sec = 0,
+                .tv_usec = 100000,
+            };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        }
+
+        uint8_t packet[SPEAKER_UDP_MAX_PACKET];
+        int n = recvfrom(sock, packet, sizeof(packet), 0, NULL, NULL);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                s_speaker_udp_last_errno = errno;
+                close(sock);
+                sock = -1;
+            }
+            continue;
+        }
+        if (!s_audio_stream_active) {
+            s_speaker_udp_drop_count++;
+            continue;
+        }
+        if (n < SPEAKER_UDP_HEADER_LEN || packet[0] != SPEAKER_UDP_MAGIC0 ||
+            packet[1] != SPEAKER_UDP_MAGIC1 || packet[2] != MAMBA_PROTOCOL_VERSION) {
+            s_speaker_udp_bad_packets++;
+            continue;
+        }
+        uint32_t seq = le32(packet + 4);
+        uint16_t sample_count = le16(packet + 12);
+        uint16_t byte_count = le16(packet + 14);
+        if (byte_count != sample_count * sizeof(int16_t) ||
+            SPEAKER_UDP_HEADER_LEN + byte_count != (uint16_t)n ||
+            (byte_count % sizeof(int16_t)) != 0) {
+            s_speaker_udp_bad_packets++;
+            continue;
+        }
+        esp_err_t err = audio_stream_write_pcm((const int16_t *)(packet + SPEAKER_UDP_HEADER_LEN), sample_count);
+        s_speaker_udp_last_seq = seq;
+        if (err == ESP_OK) {
+            s_speaker_udp_rx_packets++;
+            s_speaker_udp_rx_samples += sample_count;
+        } else {
+            s_speaker_udp_drop_count++;
+            s_speaker_udp_last_errno = err;
+        }
+    }
+    if (sock >= 0) {
+        close(sock);
+    }
+    s_speaker_udp_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static float selected_value(const selected_channel_t *channel, const battery_snapshot_t *bat,
@@ -1221,13 +1341,18 @@ void link_attach_tcp_socket(int sock, uint32_t host_ip_addr)
 
 void link_detach_tcp_socket(int sock)
 {
+    bool should_stop_stream = false;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (s_tcp_sock == sock) {
+            should_stop_stream = true;
             shutdown(s_tcp_sock, SHUT_RDWR);
             close(s_tcp_sock);
             s_tcp_sock = -1;
         }
         xSemaphoreGive(s_lock);
+    }
+    if (should_stop_stream) {
+        stop_speaker_stream(true);
     }
 }
 
@@ -1276,13 +1401,21 @@ esp_err_t link_init(const mamba_config_t *config)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "usb serial install failed: %s", esp_err_to_name(err));
     }
-    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 6144, NULL, 5, NULL);
-    ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 6144, NULL, 5, NULL);
-    ok &= xTaskCreate(hello_task, "link_hello", 3072, NULL, 3, NULL);
-    ok &= xTaskCreate(telemetry_task, "link_tel", 4096, NULL, 6, NULL);
-    ok &= xTaskCreate(selected_sample_task, "link_sel_s", 4096, NULL, 10, NULL);
-    ok &= xTaskCreate(selected_tx_task, "link_sel_tx", 4096, NULL, 7, NULL);
-    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "tasks");
+    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 4096, NULL, 5, NULL);
+    ok &= xTaskCreate(tcp_rx_task, "link_tcp_rx", 4096, NULL, 5, NULL);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "core link tasks");
+    if (xTaskCreate(hello_task, "link_hello", 2048, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "hello task disabled");
+    }
+    if (xTaskCreate(telemetry_task, "link_tel", 3072, NULL, 6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "telemetry task disabled");
+    }
+    if (xTaskCreate(selected_sample_task, "link_sel_s", 3072, NULL, 10, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "selected sample task disabled");
+    }
+    if (xTaskCreate(selected_tx_task, "link_sel_tx", 3072, NULL, 7, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "selected TX task disabled");
+    }
     ESP_LOGI(TAG, "MambaLink v%u ready, self-test=%s", MAMBA_PROTOCOL_VERSION, link_self_test() ? "ok" : "fail");
     return ESP_OK;
 }

@@ -164,17 +164,28 @@ static void battery_task(void *arg)
     }
 }
 
-static void init_adc(void)
+static esp_err_t init_adc(void)
 {
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = MAMBA_ADC_UNIT,
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc));
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_adc);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ADC unit unavailable: %s", esp_err_to_name(err));
+        s_adc = NULL;
+        return err;
+    }
     adc_oneshot_chan_cfg_t chan_cfg = {
         .atten = MAMBA_ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, MAMBA_ADC_CHANNEL, &chan_cfg));
+    err = adc_oneshot_config_channel(s_adc, MAMBA_ADC_CHANNEL, &chan_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ADC channel unavailable: %s", esp_err_to_name(err));
+        adc_oneshot_del_unit(s_adc);
+        s_adc = NULL;
+        return err;
+    }
 
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
     adc_cali_curve_fitting_config_t cali_cfg = {
@@ -185,9 +196,10 @@ static void init_adc(void)
     };
     s_do_cali = adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali) == ESP_OK;
 #endif
+    return ESP_OK;
 }
 
-static void init_i2c(void)
+static esp_err_t init_i2c(void)
 {
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -197,13 +209,26 @@ static void init_i2c(void)
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "I2C bus unavailable: %s", esp_err_to_name(err));
+        s_i2c_bus = NULL;
+        return err;
+    }
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = MAMBA_BATTERY_I2C_ADDR,
         .scl_speed_hz = MAMBA_I2C_FREQ_HZ,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev));
+    err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "I2C battery device unavailable: %s", esp_err_to_name(err));
+        i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = NULL;
+        s_i2c_dev = NULL;
+        return err;
+    }
+    return ESP_OK;
 }
 
 esp_err_t battery_init(const mamba_config_t *config)
@@ -213,8 +238,8 @@ esp_err_t battery_init(const mamba_config_t *config)
     if (!s_lock) {
         return ESP_ERR_NO_MEM;
     }
-    init_i2c();
-    init_adc();
+    (void)init_i2c();
+    (void)init_adc();
     BaseType_t ok = xTaskCreate(battery_task, "battery_task", 4096, NULL, 5, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create battery task");
     ESP_LOGI(TAG, "battery monitor started");
