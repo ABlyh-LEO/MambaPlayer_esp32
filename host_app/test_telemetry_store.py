@@ -90,7 +90,7 @@ class HostGuiSmokeTests(unittest.TestCase):
             window.close()
             self.app.processEvents()
 
-    def test_usb_catalog_frame_populates_sources(self):
+    def test_telemetry_catalog_frame_populates_sources(self):
         window = MainWindow(start_workers=False)
         try:
             payload = b'{"type":"catalog","sources":[{"key":"adc.raw","name":"ADC Raw","unit":"","value":123,"rate_hz":500}]}'

@@ -463,7 +463,7 @@ class SpeakerCapture(QtCore.QThread):
                 score = 1000
             elif "vb-audio" in lower and ("output" in lower or "input" in lower):
                 score = 700
-            elif "stereo mix" in lower or "立体声混音" in name:
+            elif "stereo mix" in lower or "\u7acb\u4f53\u58f0\u6df7\u97f3" in name:
                 score = 300
             if score:
                 score += 50 if hostapi == "Windows WASAPI" else 20 if hostapi == "Windows DirectSound" else 0
