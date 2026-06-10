@@ -40,6 +40,7 @@ from ..mamba_link import (
     decode_udp_packet,
     encode_speaker_udp_packet,
     encode_frame,
+    SPEAKER_SAMPLE_RATE,
     SPEAKER_UDP_PAYLOAD_SAMPLES,
     SPEAKER_UDP_PORT,
 )
@@ -388,17 +389,19 @@ class SpeakerControlWorker(QtCore.QThread):
     stopped = QtCore.Signal()
     failed = QtCore.Signal(str, str)
 
-    def __init__(self, transport, action: str, peer_ip: str = "", sample_rate: int = 16000) -> None:
+    def __init__(self, transport, action: str, peer_ip: str = "", sample_rate: int = SPEAKER_SAMPLE_RATE,
+                 latency_mode: str = "balanced") -> None:
         super().__init__()
         self.transport = transport
         self.action = action
         self.peer_ip = peer_ip
         self.sample_rate = sample_rate
+        self.latency_mode = latency_mode
 
     def run(self) -> None:
         try:
             if self.action == "start":
-                payload = json.dumps({"sample_rate": self.sample_rate}).encode()
+                payload = json.dumps({"sample_rate": self.sample_rate, "latency_mode": self.latency_mode}).encode()
                 self.transport.send_wait(TYPE_AUDIO_STREAM_START, payload, timeout=8.0)
                 self.started.emit(self.peer_ip)
             else:
@@ -413,7 +416,7 @@ class SpeakerCapture(QtCore.QThread):
     state = QtCore.Signal(str)
     failed = QtCore.Signal(str)
 
-    def __init__(self, target_rate: int = 16000) -> None:
+    def __init__(self, target_rate: int = SPEAKER_SAMPLE_RATE) -> None:
         super().__init__()
         self.target_rate = target_rate
         self._running = True
@@ -683,9 +686,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_stop = QtWidgets.QPushButton("Stop Audio")
         self.speaker_button = QtWidgets.QPushButton("Start Speaker Mode")
         self.speaker_button.setCheckable(True)
+        self.speaker_latency = QtWidgets.QComboBox()
+        self.speaker_latency.addItem("Balanced", "balanced")
+        self.speaker_latency.addItem("Low Latency", "low_latency")
+        self.speaker_latency.addItem("Quality", "quality")
         self.audio_status = QtWidgets.QLabel("audio idle")
         for widget in (self.power_upload, self.alarm_upload, self.power_test, self.alarm_test,
-                       self.audio_stop, self.speaker_button, self.audio_status):
+                       self.audio_stop, self.speaker_latency, self.speaker_button, self.audio_status):
             audio.addWidget(widget)
         layout.addLayout(audio)
 
@@ -735,6 +742,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vofa_remote.setValue(int(self.project.get("vofa_remote_port", DEFAULT_PROJECT["vofa_remote_port"])))
         self.vofa_local.setValue(int(self.project.get("vofa_local_port", DEFAULT_PROJECT["vofa_local_port"])))
         self.can_ids_edit.setText(",".join(f"0x{can_id:03X}" for can_id in self.can_ids))
+        latency = str(self.project.get("speaker_latency_mode", "balanced"))
+        index = self.speaker_latency.findData(latency)
+        self.speaker_latency.setCurrentIndex(index if index >= 0 else 0)
         self._refresh_firmware_table()
         self._refresh_channels_table()
         self._refresh_sources_table()
@@ -794,6 +804,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except json.JSONDecodeError:
             return
         battery = data.get("battery", {})
+        audio = data.get("audio", {})
+        diag = audio.get("diag", {}) if isinstance(audio, dict) else {}
+        if self.speaker_worker and diag:
+            self.audio_status.setText(
+                "speaker buffer {}/{} ms lost {} underrun {} overrun {}".format(
+                    diag.get("speaker_buffer_ms", 0),
+                    diag.get("speaker_buffer_target_ms", 0),
+                    diag.get("speaker_lost_packets", 0),
+                    diag.get("speaker_underruns", 0),
+                    diag.get("speaker_overruns", 0),
+                )
+            )
         now = time.monotonic()
         fallback = [
             ("adc.battery_mv", "ADC Battery", "mV", battery.get("adc_mv"), 500),
@@ -1092,6 +1114,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "firmware_channels": self.firmware_channels[:16],
             "can_ids": self.can_ids[:16],
             "vofa_channels": self.vofa_channels,
+            "speaker_latency_mode": self.speaker_latency.currentData() or "balanced",
         })
         save_project(self.project_path, self.project)
         self._log(f"project saved: {self.project_path}")
@@ -1112,6 +1135,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "udp_packets": self.speaker_udp_packets,
                 "udp_bytes": self.speaker_udp_bytes,
                 "udp_last_error": self.speaker_udp_last_error,
+                "latency_mode": self.speaker_latency.currentData() or "balanced",
+                "sample_rate": SPEAKER_SAMPLE_RATE,
             },
             "updated_at": time.time(),
         }
@@ -1169,7 +1194,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.speaker_button.setEnabled(False)
         self.speaker_button.setText("Starting Speaker Mode..." if action == "start" else "Stopping Speaker Mode...")
         self.audio_status.setText("speaker control pending")
-        worker = SpeakerControlWorker(transport, action, peer_ip)
+        latency_mode = self.speaker_latency.currentData() or "balanced"
+        worker = SpeakerControlWorker(transport, action, peer_ip, latency_mode=latency_mode)
         worker.started.connect(self._finish_speaker_started)
         worker.stopped.connect(self._finish_speaker_stopped)
         worker.failed.connect(self._speaker_control_failed)
@@ -1186,7 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.speaker_worker.start()
         self.speaker_button.setText("Stop Speaker Mode")
         self.speaker_button.setEnabled(True)
-        self.audio_status.setText(f"speaker UDP {peer_ip}:{SPEAKER_UDP_PORT}")
+        self.audio_status.setText(f"speaker {SPEAKER_SAMPLE_RATE // 1000}k {self.speaker_latency.currentText()} {peer_ip}:{SPEAKER_UDP_PORT}")
 
     def _finish_speaker_stopped(self) -> None:
         self._stop_local_speaker_capture()

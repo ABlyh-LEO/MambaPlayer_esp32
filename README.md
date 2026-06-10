@@ -77,6 +77,8 @@ Frames are JustFloat: little-endian `float32[]` followed by `00 00 80 7F`.
 With VB-CABLE installed, Speaker Mode prefers `CABLE Output` capture while
 Windows or an individual player outputs to `CABLE Input`, so the device behaves
 like a virtual speaker target without relying on the PC's physical speakers.
+Speaker Mode streams `32 kHz` mono PCM over UDP and uses a firmware jitter
+buffer; uploaded power-on/alarm audio remains `16 kHz` mono IMA ADPCM WAV.
 
 See [host_app/README.md](host_app/README.md) for details and probe commands.
 

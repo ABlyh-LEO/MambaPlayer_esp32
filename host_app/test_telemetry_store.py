@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import unittest
@@ -8,7 +9,7 @@ import numpy as np
 from PySide6 import QtWidgets
 
 from .telemetry.store import TelemetryStore
-from .mamba_link import TYPE_AUDIO_STREAM_START, TYPE_AUDIO_STREAM_STOP, TYPE_STATUS, TYPE_TELEMETRY
+from .mamba_link import SPEAKER_SAMPLE_RATE, TYPE_AUDIO_STREAM_START, TYPE_AUDIO_STREAM_STOP, TYPE_STATUS, TYPE_TELEMETRY
 from .ui.main_window import MainWindow, SpeakerControlWorker
 from .ui.theme import apply_light_theme
 
@@ -158,6 +159,9 @@ class HostGuiSmokeTests(unittest.TestCase):
         worker.run()
         self.assertEqual([call[0] for call in transport.calls], [TYPE_AUDIO_STREAM_START])
         self.assertEqual(transport.calls[-1][2], 8.0)
+        payload = json.loads(transport.calls[-1][1].decode())
+        self.assertEqual(payload["sample_rate"], SPEAKER_SAMPLE_RATE)
+        self.assertEqual(payload["latency_mode"], "balanced")
 
 
 if __name__ == "__main__":

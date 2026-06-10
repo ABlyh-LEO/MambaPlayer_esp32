@@ -21,7 +21,7 @@ The app listens on:
 
 USB Serial/JTAG uses the same MambaLink frame format as TCP. When both links
 are available, the GUI prefers TCP for control and audio upload. Speaker Mode
-uses TCP only to start/stop the stream, then sends `16 kHz` mono PCM over UDP
+uses TCP only to start/stop the stream, then sends `32 kHz` mono PCM over UDP
 `37213` in 5 ms packets. USB remains the fallback path for configuration and is
 still used for first-time Wi-Fi setup, but low-latency Speaker Mode requires a
 TCP/Wi-Fi connection so the host knows the ESP32 address.
@@ -63,8 +63,9 @@ TCP/Wi-Fi connection so the host knows the ESP32 address.
   normalization before transfer.
 - Power-on audio is limited to 10 seconds. Alarm audio uses the remaining
   storage budget reported by the firmware partition assumptions.
-- Speaker Mode streams `16 kHz` mono PCM to the firmware through UDP `37213`;
-  start/stop ACKs still use TCP. On Windows it prefers VB-CABLE: set Windows or
+- Speaker Mode streams `32 kHz` mono PCM to the firmware through UDP `37213`;
+  start/stop ACKs still use TCP. The firmware uses a jitter buffer with
+  Low Latency, Balanced and Quality modes; Balanced is the default. On Windows it prefers VB-CABLE: set Windows or
   the target player output device to `CABLE Input (VB-Audio Virtual Cable)`,
   then the app captures `CABLE Output (VB-Audio Virtual Cable)`.
 - Closing the host app sends a stop command first. If TCP is closed abruptly,
@@ -75,8 +76,9 @@ TCP/Wi-Fi connection so the host knows the ESP32 address.
   This keeps boot stable before Wi-Fi/lwIP is ready and avoids opening the audio
   data socket while the device is still initializing.
 - `probe snapshot` includes host-side Speaker UDP target and packet counters.
-  Firmware status includes `audio.diag.speaker_udp_*` and I2S write counters for
-  checking whether packets reach the ESP32 and are written to the amplifier.
+  Firmware status includes `audio.diag.speaker_udp_*`, buffer watermarks,
+  underrun/overrun, PLC and drift counters for checking whether packets reach
+  the ESP32 and are being played smoothly.
 
 ## Probe Commands
 

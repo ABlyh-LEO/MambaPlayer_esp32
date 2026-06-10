@@ -34,6 +34,10 @@
 #define SPEAKER_UDP_MAGIC1 'S'
 #define SPEAKER_UDP_HEADER_LEN 16
 #define SPEAKER_UDP_MAX_PACKET 512
+#define SPEAKER_RING_SAMPLES 4096
+#define SPEAKER_PLAY_CHUNK_SAMPLES 128
+#define SPEAKER_MIN_SAMPLE_RATE_HZ 16000
+#define SPEAKER_MAX_SAMPLE_RATE_HZ 32000
 
 typedef enum {
     LINK_TX_USB,
@@ -95,8 +99,20 @@ typedef enum {
 typedef struct {
     speaker_ctrl_type_t type;
     uint32_t sample_rate_hz;
+    uint16_t target_ms;
+    uint16_t start_ms;
+    uint16_t min_ms;
+    uint16_t max_ms;
     bool resume_alarm;
 } speaker_ctrl_msg_t;
+
+typedef struct {
+    const char *name;
+    uint16_t target_ms;
+    uint16_t start_ms;
+    uint16_t min_ms;
+    uint16_t max_ms;
+} speaker_latency_profile_t;
 
 static const char *TAG = "link";
 static SemaphoreHandle_t s_lock;
@@ -126,8 +142,29 @@ static volatile uint32_t s_speaker_udp_rx_samples;
 static volatile uint32_t s_speaker_udp_drop_count;
 static volatile uint32_t s_speaker_udp_bad_packets;
 static volatile uint32_t s_speaker_udp_last_seq;
+static volatile uint32_t s_speaker_udp_lost_packets;
+static volatile uint32_t s_speaker_buffer_underruns;
+static volatile uint32_t s_speaker_buffer_overruns;
+static volatile uint32_t s_speaker_plc_samples;
+static volatile uint32_t s_speaker_drift_adjustments;
+static volatile uint32_t s_speaker_buffer_ms;
+static volatile uint32_t s_speaker_buffer_target_ms = 48;
 static volatile int s_speaker_udp_last_errno;
 static TaskHandle_t s_speaker_udp_task_handle;
+static TaskHandle_t s_speaker_play_task_handle;
+static portMUX_TYPE s_speaker_buf_mux = portMUX_INITIALIZER_UNLOCKED;
+static int16_t s_speaker_ring[SPEAKER_RING_SAMPLES];
+static uint16_t s_speaker_read_pos;
+static uint16_t s_speaker_write_pos;
+static uint16_t s_speaker_fill;
+static uint16_t s_speaker_start_samples;
+static uint16_t s_speaker_min_samples;
+static uint16_t s_speaker_target_samples;
+static uint16_t s_speaker_max_samples;
+static uint32_t s_speaker_sample_rate_hz = MAMBA_SPEAKER_SAMPLE_RATE_HZ;
+static int16_t s_speaker_last_sample;
+static bool s_speaker_play_started;
+static bool s_speaker_seq_seen;
 static audio_upload_t s_upload;
 static uint8_t s_tx_buf[LINK_HEADER_LEN + MAMBA_LINK_MAX_PAYLOAD];
 static link_parser_t s_tcp_parser;
@@ -146,7 +183,14 @@ static float s_selected_batch[SELECTED_BATCH_SAMPLES][MAMBA_SELECTED_MAX_CHANNEL
 static uint8_t s_selected_batch_count;
 
 static void speaker_udp_task(void *arg);
+static void speaker_play_task(void *arg);
 static void speaker_control_task(void *arg);
+
+static const speaker_latency_profile_t SPEAKER_PROFILES[] = {
+    {"low_latency", 24, 16, 8, 80},
+    {"balanced", 48, 32, 12, 120},
+    {"quality", 90, 60, 24, 120},
+};
 
 static int ensure_udp_socket(void)
 {
@@ -497,6 +541,138 @@ static void drain_realtime_telemetry(void)
     }
 }
 
+static uint16_t speaker_ms_to_samples(uint16_t ms, uint32_t rate_hz)
+{
+    uint32_t samples = (rate_hz * (uint32_t)ms) / 1000;
+    if (samples >= SPEAKER_RING_SAMPLES) {
+        samples = SPEAKER_RING_SAMPLES - 1;
+    }
+    return (uint16_t)samples;
+}
+
+static speaker_latency_profile_t speaker_profile_from_name(const char *name)
+{
+    for (size_t i = 0; i < sizeof(SPEAKER_PROFILES) / sizeof(SPEAKER_PROFILES[0]); ++i) {
+        if (name && strcmp(name, SPEAKER_PROFILES[i].name) == 0) {
+            return SPEAKER_PROFILES[i];
+        }
+    }
+    return SPEAKER_PROFILES[1];
+}
+
+static void speaker_buffer_reset(const speaker_ctrl_msg_t *msg)
+{
+    uint32_t rate = msg->sample_rate_hz;
+    if (rate < SPEAKER_MIN_SAMPLE_RATE_HZ || rate > SPEAKER_MAX_SAMPLE_RATE_HZ) {
+        rate = MAMBA_SPEAKER_SAMPLE_RATE_HZ;
+    }
+    taskENTER_CRITICAL(&s_speaker_buf_mux);
+    s_speaker_read_pos = 0;
+    s_speaker_write_pos = 0;
+    s_speaker_fill = 0;
+    s_speaker_last_sample = 0;
+    s_speaker_play_started = false;
+    s_speaker_seq_seen = false;
+    s_speaker_sample_rate_hz = rate;
+    s_speaker_start_samples = speaker_ms_to_samples(msg->start_ms, rate);
+    s_speaker_min_samples = speaker_ms_to_samples(msg->min_ms, rate);
+    s_speaker_target_samples = speaker_ms_to_samples(msg->target_ms, rate);
+    s_speaker_max_samples = speaker_ms_to_samples(msg->max_ms, rate);
+    if (s_speaker_max_samples <= s_speaker_target_samples) {
+        s_speaker_max_samples = SPEAKER_RING_SAMPLES - 1;
+    }
+    s_speaker_buffer_ms = 0;
+    s_speaker_buffer_target_ms = msg->target_ms;
+    taskEXIT_CRITICAL(&s_speaker_buf_mux);
+}
+
+static void speaker_update_buffer_ms(uint16_t fill)
+{
+    uint32_t rate = s_speaker_sample_rate_hz ? s_speaker_sample_rate_hz : MAMBA_SPEAKER_SAMPLE_RATE_HZ;
+    s_speaker_buffer_ms = (uint32_t)fill * 1000U / rate;
+}
+
+static void speaker_drop_oldest_locked(void)
+{
+    if (s_speaker_fill == 0) {
+        return;
+    }
+    s_speaker_read_pos = (uint16_t)((s_speaker_read_pos + 1) % SPEAKER_RING_SAMPLES);
+    s_speaker_fill--;
+    s_speaker_buffer_overruns++;
+}
+
+static void speaker_buffer_write(const int16_t *samples, uint16_t count)
+{
+    if (!samples || count == 0) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_speaker_buf_mux);
+    for (uint16_t i = 0; i < count; ++i) {
+        while (s_speaker_fill >= s_speaker_max_samples || s_speaker_fill >= SPEAKER_RING_SAMPLES - 1) {
+            speaker_drop_oldest_locked();
+        }
+        s_speaker_ring[s_speaker_write_pos] = samples[i];
+        s_speaker_write_pos = (uint16_t)((s_speaker_write_pos + 1) % SPEAKER_RING_SAMPLES);
+        s_speaker_fill++;
+    }
+    uint16_t fill = s_speaker_fill;
+    taskEXIT_CRITICAL(&s_speaker_buf_mux);
+    speaker_update_buffer_ms(fill);
+}
+
+static uint16_t speaker_buffer_read(int16_t *out, uint16_t count)
+{
+    if (!out || count == 0) {
+        return 0;
+    }
+    uint16_t out_pos = 0;
+    uint16_t high_margin = speaker_ms_to_samples(10, s_speaker_sample_rate_hz);
+    taskENTER_CRITICAL(&s_speaker_buf_mux);
+    if (!s_speaker_play_started) {
+        if (s_speaker_fill < s_speaker_start_samples) {
+            uint16_t fill = s_speaker_fill;
+            taskEXIT_CRITICAL(&s_speaker_buf_mux);
+            speaker_update_buffer_ms(fill);
+            return 0;
+        }
+        s_speaker_play_started = true;
+    }
+    if (s_speaker_fill > s_speaker_target_samples + high_margin) {
+        speaker_drop_oldest_locked();
+        s_speaker_drift_adjustments++;
+    } else if (s_speaker_fill > 0 && s_speaker_fill < s_speaker_min_samples && out_pos < count) {
+        out[out_pos++] = s_speaker_last_sample;
+        s_speaker_drift_adjustments++;
+    }
+    while (out_pos < count && s_speaker_fill > 0) {
+        int16_t sample = s_speaker_ring[s_speaker_read_pos];
+        out[out_pos++] = sample;
+        s_speaker_last_sample = sample;
+        s_speaker_read_pos = (uint16_t)((s_speaker_read_pos + 1) % SPEAKER_RING_SAMPLES);
+        s_speaker_fill--;
+    }
+    uint16_t fill = s_speaker_fill;
+    taskEXIT_CRITICAL(&s_speaker_buf_mux);
+    speaker_update_buffer_ms(fill);
+    return out_pos;
+}
+
+static void speaker_fill_plc(int16_t *out, uint16_t start, uint16_t count)
+{
+    if (!out || start >= count) {
+        return;
+    }
+    int32_t sample = s_speaker_last_sample;
+    for (uint16_t i = start; i < count; ++i) {
+        sample = (sample * 31) / 32;
+        out[i] = (int16_t)sample;
+    }
+    s_speaker_last_sample = (int16_t)sample;
+    s_speaker_plc_samples += count - start;
+    s_speaker_buffer_underruns++;
+}
+
 static void send_udp_payload(uint8_t stream_id, const void *payload, size_t len)
 {
     if (s_audio_stream_active && stream_id != MAMBA_STREAM_CATALOG) {
@@ -561,7 +737,11 @@ static void send_status(link_tx_target_t target, uint16_t seq)
         "\"alarm\":{\"active\":%s,\"offset\":%lu,\"transitions\":%lu},"
         "\"audio\":{\"playing\":%s,\"current\":\"%s\","
         "\"diag\":{\"speaker_udp_packets\":%lu,\"speaker_udp_samples\":%lu,\"speaker_udp_drops\":%lu,"
-        "\"speaker_udp_bad\":%lu,\"speaker_udp_seq\":%lu,\"speaker_udp_errno\":%d,\"speaker_udp_port\":%u}},"
+        "\"speaker_udp_bad\":%lu,\"speaker_udp_seq\":%lu,\"speaker_lost_packets\":%lu,"
+        "\"speaker_udp_errno\":%d,\"speaker_udp_port\":%u,"
+        "\"speaker_buffer_ms\":%lu,\"speaker_buffer_target_ms\":%lu,"
+        "\"speaker_underruns\":%lu,\"speaker_overruns\":%lu,"
+        "\"speaker_plc_samples\":%lu,\"speaker_drift_adjustments\":%lu}},"
         "\"can\":{\"started\":%s,\"bitrate\":%lu,\"rx\":%lu,\"dropped\":%lu},"
         "\"link\":{\"udp_tel\":%u,\"udp_sent\":%lu,\"udp_errors\":%lu,\"udp_errno\":%d,\"udp_stream\":%u,"
         "\"usb_rx_bytes\":%lu,\"usb_rx_frames\":%lu,\"tcp_rx_bytes\":%lu,\"tcp_rx_frames\":%lu,\"tcp_rx_errors\":%lu,"
@@ -578,8 +758,12 @@ static void send_status(link_tx_target_t target, uint16_t seq)
         audio.playing ? "true" : "false", audio.file,
         (unsigned long)s_speaker_udp_rx_packets, (unsigned long)s_speaker_udp_rx_samples,
         (unsigned long)s_speaker_udp_drop_count, (unsigned long)s_speaker_udp_bad_packets,
-        (unsigned long)s_speaker_udp_last_seq, s_speaker_udp_last_errno,
+        (unsigned long)s_speaker_udp_last_seq, (unsigned long)s_speaker_udp_lost_packets,
+        s_speaker_udp_last_errno,
         MAMBA_LINK_UDP_SPEAKER_PORT,
+        (unsigned long)s_speaker_buffer_ms, (unsigned long)s_speaker_buffer_target_ms,
+        (unsigned long)s_speaker_buffer_underruns, (unsigned long)s_speaker_buffer_overruns,
+        (unsigned long)s_speaker_plc_samples, (unsigned long)s_speaker_drift_adjustments,
         can.started ? "true" : "false", (unsigned long)can.bitrate,
         (unsigned long)can.rx_count, (unsigned long)can.dropped_count,
         s_udp_tel_port, (unsigned long)s_udp_send_count, (unsigned long)s_udp_send_errors,
@@ -800,7 +984,20 @@ static void handle_audio_test(const link_rx_frame_t *frame)
 
 static void handle_audio_stream_start(const link_rx_frame_t *frame)
 {
-    uint32_t rate = MAMBA_AUDIO_SAMPLE_RATE_HZ;
+    uint32_t rate = MAMBA_SPEAKER_SAMPLE_RATE_HZ;
+    char mode[24] = "balanced";
+    if (frame->len > 0) {
+        char body[160];
+        size_t copy_len = frame->len < sizeof(body) - 1 ? frame->len : sizeof(body) - 1;
+        memcpy(body, frame->payload, copy_len);
+        body[copy_len] = 0;
+        json_get_u32(body, "sample_rate", &rate);
+        json_get_string(body, "latency_mode", mode, sizeof(mode));
+    }
+    if (rate < SPEAKER_MIN_SAMPLE_RATE_HZ || rate > SPEAKER_MAX_SAMPLE_RATE_HZ) {
+        rate = MAMBA_SPEAKER_SAMPLE_RATE_HZ;
+    }
+    speaker_latency_profile_t profile = speaker_profile_from_name(mode);
     if (!s_speaker_ctrl_queue) {
         send_error_to(frame->reply_target, frame->seq, "speaker control unavailable");
         return;
@@ -818,6 +1015,10 @@ static void handle_audio_stream_start(const link_rx_frame_t *frame)
     speaker_ctrl_msg_t msg = {
         .type = SPEAKER_CTRL_START,
         .sample_rate_hz = rate,
+        .target_ms = profile.target_ms,
+        .start_ms = profile.start_ms,
+        .min_ms = profile.min_ms,
+        .max_ms = profile.max_ms,
     };
     xQueueOverwrite(s_speaker_ctrl_queue, &msg);
 }
@@ -1094,20 +1295,46 @@ static void speaker_udp_task(void *arg)
             s_speaker_udp_bad_packets++;
             continue;
         }
-        esp_err_t err = audio_stream_write_pcm((const int16_t *)(packet + SPEAKER_UDP_HEADER_LEN), sample_count);
-        s_speaker_udp_last_seq = seq;
-        if (err == ESP_OK) {
-            s_speaker_udp_rx_packets++;
-            s_speaker_udp_rx_samples += sample_count;
+        if (s_speaker_seq_seen) {
+            uint32_t expected = s_speaker_udp_last_seq + 1;
+            if (seq != expected) {
+                s_speaker_udp_lost_packets += seq > expected ? seq - expected : 1;
+            }
         } else {
-            s_speaker_udp_drop_count++;
-            s_speaker_udp_last_errno = err;
+            s_speaker_seq_seen = true;
         }
+        speaker_buffer_write((const int16_t *)(packet + SPEAKER_UDP_HEADER_LEN), sample_count);
+        s_speaker_udp_last_seq = seq;
+        s_speaker_udp_rx_packets++;
+        s_speaker_udp_rx_samples += sample_count;
     }
     if (sock >= 0) {
         close(sock);
     }
     s_speaker_udp_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void speaker_play_task(void *arg)
+{
+    int16_t chunk[SPEAKER_PLAY_CHUNK_SAMPLES];
+    while (s_audio_stream_active) {
+        uint16_t got = speaker_buffer_read(chunk, SPEAKER_PLAY_CHUNK_SAMPLES);
+        if (got == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        if (got < SPEAKER_PLAY_CHUNK_SAMPLES) {
+            speaker_fill_plc(chunk, got, SPEAKER_PLAY_CHUNK_SAMPLES);
+        }
+        esp_err_t err = audio_stream_write_pcm(chunk, SPEAKER_PLAY_CHUNK_SAMPLES);
+        if (err != ESP_OK) {
+            s_speaker_udp_drop_count++;
+            s_speaker_udp_last_errno = err;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    s_speaker_play_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -1120,6 +1347,7 @@ static void speaker_control_task(void *arg)
         }
         if (msg.type == SPEAKER_CTRL_START) {
             (void)audio_stop_and_save_offset();
+            speaker_buffer_reset(&msg);
             esp_err_t err = audio_stream_start(msg.sample_rate_hz);
             if (err != ESP_OK) {
                 s_audio_stream_active = false;
@@ -1132,9 +1360,22 @@ static void speaker_control_task(void *arg)
             s_speaker_udp_drop_count = 0;
             s_speaker_udp_bad_packets = 0;
             s_speaker_udp_last_seq = 0;
+            s_speaker_udp_lost_packets = 0;
+            s_speaker_buffer_underruns = 0;
+            s_speaker_buffer_overruns = 0;
+            s_speaker_plc_samples = 0;
+            s_speaker_drift_adjustments = 0;
             s_speaker_udp_last_errno = 0;
             if (!s_speaker_udp_task_handle &&
                 xTaskCreate(speaker_udp_task, "link_spk_udp", 3072, NULL, 5, &s_speaker_udp_task_handle) != pdPASS) {
+                s_audio_stream_active = false;
+                alarm_set_speaker_suppressed(false);
+                s_speaker_udp_last_errno = ESP_ERR_NO_MEM;
+                audio_stream_stop();
+                continue;
+            }
+            if (!s_speaker_play_task_handle &&
+                xTaskCreate(speaker_play_task, "link_spk_play", 4096, NULL, 6, &s_speaker_play_task_handle) != pdPASS) {
                 s_audio_stream_active = false;
                 alarm_set_speaker_suppressed(false);
                 s_speaker_udp_last_errno = ESP_ERR_NO_MEM;
@@ -1453,7 +1694,7 @@ esp_err_t link_init(const mamba_config_t *config)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "usb serial install failed: %s", esp_err_to_name(err));
     }
-    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 4096, NULL, 5, NULL);
+    BaseType_t ok = xTaskCreate(usb_rx_task, "link_usb_rx", 6144, NULL, 5, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "core link tasks");
     if (xTaskCreate(hello_task, "link_hello", 2048, NULL, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "hello task disabled");

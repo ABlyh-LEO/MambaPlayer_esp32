@@ -14,7 +14,7 @@ extern "C" {
 
 #define MAMBA_LINK_SYNC0 'M'
 #define MAMBA_LINK_SYNC1 'L'
-#define MAMBA_LINK_MAX_PAYLOAD 1024
+#define MAMBA_LINK_MAX_PAYLOAD 1536
 
 typedef enum {
     MAMBA_LINK_TYPE_HELLO = 1,

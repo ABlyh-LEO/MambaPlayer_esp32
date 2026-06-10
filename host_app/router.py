@@ -17,6 +17,7 @@ DEFAULT_PROJECT = {
     "firmware_channels": [],
     "can_ids": [],
     "vofa_channels": [],
+    "speaker_latency_mode": "balanced",
     "theme": "light",
 }
 
